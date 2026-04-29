@@ -1,0 +1,44 @@
+gcp-pkg:
+  _provides_capability:
+  - gcp-pkg: 1.0.0
+  seed:
+    project:
+      id: ""
+      environment: "Development"
+    region: "us-central1"
+    org_id: ""
+    auth_method: "impersonation"
+    state_bucket: ""
+    wif:
+      enabled: false
+  config_params:
+    # All units under gcp-pkg/_stack/gcp are EXAMPLES — they exist as templates
+    # for copy-paste into a deployment package (e.g. pwy-home-lab-pkg).
+    # _skip_on_build: true (inherited) excludes them from all build/apply runs.
+    # _env, _region, and project_prefix are dummies required so that unit-level
+    # try() fallbacks can evaluate without crashing (Terragrunt evaluates unit
+    # locals during dependency-graph discovery, before the exclude block fires).
+    gcp-pkg/_stack/gcp:
+      _skip_on_build: true
+      _env: example
+      _region: us-central1
+      project_prefix: example
+  waves:
+  - _skip_on_wave_run: true
+    description: 'Create cloud storage buckets (AWS S3, GCP GCS, Azure Blob) used
+      for shared artifact storage. Idempotent — existing buckets are adopted without
+      re-creation. Test verifies each bucket is accessible.
+
+      '
+    name: cloud.storage
+    test_ansible_playbook: cloud/cloud-resources-all-resources-test
+    update_inventory: true
+  - _skip_on_wave_run: true
+    description: 'Provision GKE clusters on GCP and write per-cluster kubeconfig files
+      to $_DYNAMIC_DIR/kubeconfig/. Skipped on clean (clusters are long-lived and
+      expensive to recreate). Test fetches and validates kubeconfig.
+
+      '
+    name: cloud.k8s
+    test_ansible_playbook: cloud/gke-kubeconfig-test
+    update_inventory: false

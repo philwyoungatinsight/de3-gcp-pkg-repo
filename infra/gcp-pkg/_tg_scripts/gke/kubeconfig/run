@@ -1,0 +1,146 @@
+#!/bin/bash
+# Configure kubectl access to the GKE cluster via gcloud get-credentials.
+# Reads cluster_name, region, project, and KUBECONFIG filename from YAML.
+# The kubeconfig file is written to $_DYNAMIC_DIR/kubeconfig/<KUBECONFIG>.
+# --build: calls gcloud container clusters get-credentials
+# --clean: removes the dedicated kubeconfig file
+
+set -euo pipefail
+function handle_error {
+    local exit_status=$?
+    echo "An error occurred on line $LINENO: $BASH_COMMAND"
+    exit $exit_status
+}
+trap handle_error ERR
+
+GIT_ROOT="$(git rev-parse --show-toplevel)"
+. "$GIT_ROOT/set_env.sh"
+
+_read_config() {
+    python3 - "$_INFRA_DIR" <<'PYEOF'
+import sys, os, yaml, glob
+
+infra_dir = sys.argv[1]
+
+def load_config_params(yaml_path):
+    """Load flat config_params from a package YAML (new top-level format)."""
+    try:
+        with open(yaml_path) as f:
+            cfg = yaml.safe_load(f)
+    except Exception:
+        return {}
+    if not isinstance(cfg, dict):
+        return {}
+    for pkg_data in cfg.values():
+        if isinstance(pkg_data, dict):
+            cp = pkg_data.get('config_params', {})
+            if isinstance(cp, dict) and cp:
+                return cp
+    return {}
+
+# Merge config_params from all non-secrets package YAMLs.
+all_cp = {}
+for yf in sorted(glob.glob(f"{infra_dir}/*/_config/*.yaml")):
+    if '.sops.' not in yf:
+        all_cp.update(load_config_params(yf))
+
+# Discover cluster: find config_params entry with 'cluster_name'.
+# Exclude /examples/ paths and _skip_on_build: true — they are not real deployments.
+cluster_entries = [
+    (k, v) for k, v in all_cp.items()
+    if isinstance(v, dict)
+    and 'cluster_name' in v
+    and '/examples/' not in k
+    and not v.get('_skip_on_build', False)
+]
+if len(cluster_entries) != 1:
+    raise SystemExit(
+        f"Expected exactly 1 non-example GKE cluster entry across all packages, "
+        f"found {len(cluster_entries)}: {[k for k, _ in cluster_entries]}"
+    )
+cluster_path_key = cluster_entries[0][0]
+cluster_v        = cluster_entries[0][1]
+cluster_name     = cluster_v['cluster_name']
+
+# Discover location: prefer 'location' on the cluster entry, then ancestor 'region'.
+if 'location' in cluster_v:
+    region = cluster_v['location']
+else:
+    ancestor_region = next(
+        (v['region'] for k, v in sorted(all_cp.items())
+         if cluster_path_key.startswith(k) and isinstance(v, dict) and 'region' in v),
+        None
+    )
+    if not ancestor_region:
+        raise SystemExit("No 'location' or 'region' found for the cluster")
+    region = ancestor_region
+
+# Discover project: look for _provider_gcp_project on the cluster's ancestor paths.
+project = next(
+    (v['_provider_gcp_project'] for k, v in sorted(all_cp.items())
+     if cluster_path_key.startswith(k) and isinstance(v, dict)
+     and '_provider_gcp_project' in v),
+    None
+)
+if not project:
+    raise SystemExit("No '_provider_gcp_project' found on any ancestor of the cluster path")
+
+# Derive kubeconfig filename from the cluster path's last component.
+kb_entries = [(k, v) for k, v in all_cp.items()
+              if isinstance(v, dict) and 'KUBECONFIG' in v and '/examples/' not in k]
+cluster_dir_name = cluster_path_key.rstrip('/').split('/')[-1]
+kubeconfig_file  = kb_entries[0][1]['KUBECONFIG'] if kb_entries else f"{cluster_dir_name}_kubeconfig.yaml"
+
+print(f"CLUSTER_NAME={cluster_name}")
+print(f"REGION={region}")
+print(f"PROJECT={project}")
+print(f"KUBECONFIG_FILE={kubeconfig_file}")
+PYEOF
+}
+
+eval "$(_read_config)"
+
+KUBECONFIG_DIR="$_DYNAMIC_DIR/kubeconfig"
+KUBECONFIG_PATH="$KUBECONFIG_DIR/$KUBECONFIG_FILE"
+
+_ensure_gke_auth_plugin() {
+    if command -v gke-gcloud-auth-plugin >/dev/null 2>&1; then
+        return 0
+    fi
+    echo "==> Installing gke-gcloud-auth-plugin (required for kubectl GKE access)..."
+    # gcloud installed via apt requires the package manager; component manager is disabled.
+    SDK_ROOT="$(gcloud info --format='value(installation.sdk_root)' 2>/dev/null || true)"
+    if [ -f /etc/debian_version ] && dpkg -l google-cloud-sdk >/dev/null 2>&1; then
+        sudo apt-get install -y google-cloud-sdk-gke-gcloud-auth-plugin
+    elif [ -n "$SDK_ROOT" ]; then
+        gcloud components install gke-gcloud-auth-plugin --quiet
+    else
+        echo "ERROR: cannot determine how to install gke-gcloud-auth-plugin" >&2
+        echo "       Install manually: https://cloud.google.com/kubernetes-engine/docs/how-to/cluster-access-for-kubectl#install_plugin" >&2
+        exit 1
+    fi
+}
+
+case "${1:-}" in
+  --build)
+    echo "==> Fetching GKE credentials for cluster: $CLUSTER_NAME"
+    echo "    location: $REGION  project: $PROJECT"
+    echo "    kubeconfig: $KUBECONFIG_PATH"
+    _ensure_gke_auth_plugin
+    mkdir -p "$KUBECONFIG_DIR"
+    KUBECONFIG="$KUBECONFIG_PATH" gcloud container clusters get-credentials "$CLUSTER_NAME" \
+        --location "$REGION" \
+        --project "$PROJECT"
+    echo "==> kubectl access configured."
+    echo "    Use: KUBECONFIG=$KUBECONFIG_PATH kubectl ..."
+    ;;
+  --clean)
+    echo "==> Removing kubeconfig file: $KUBECONFIG_PATH"
+    rm -f "$KUBECONFIG_PATH"
+    echo "==> Kubeconfig cleanup done."
+    ;;
+  *)
+    echo "Usage: $0 --build | --clean" >&2
+    exit 1
+    ;;
+esac

@@ -1,0 +1,1835 @@
+#!/bin/bash
+# gcp-pkg seed — provisions the GCP seed project, service account, GCS state bucket,
+# and Workload Identity Federation for keyless CI/CD authentication.
+# Extracted from scripts/human-only-scripts/setup/seed-accounts/gcp_seed/run.
+
+set -euo pipefail
+
+function handle_error {
+    local exit_status=$?
+    echo "An error occurred on line ${LINENO:-not-defined}: ${BASH_COMMAND:-not-defined}"
+    exit $exit_status
+}
+trap handle_error ERR
+
+GIT_ROOT="$(git rev-parse --show-toplevel)"
+. "$GIT_ROOT/set_env.sh"
+. "$_UTILITIES_DIR/bash/framework-utils.sh"
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+
+################################################################################
+# Configuration Loading
+################################################################################
+
+_load_seed_config() {
+    COMP_NAME='gcp-pkg'
+
+    COMPONENT_CONF=$(_find_component_config "$COMP_NAME") || exit 1
+
+    # Load configuration - required structure: gcp-pkg.seed.project.id
+    PROJECT_ID=$(yq -r '."gcp-pkg".seed.project.id // null' "$COMPONENT_CONF")
+    if [ -z "$PROJECT_ID" ] || [ "$PROJECT_ID" = "null" ]; then
+        echo "Error: seed.project.id not found in configuration."
+        echo ""
+        echo "Required format in gcp-pkg.yaml:"
+        echo "  gcp-pkg:"
+        echo "    seed:"
+        echo "      project:"
+        echo "        id: \"your-project-id\""
+        echo "        environment: \"Development\""
+        echo ""
+        exit 1
+    fi
+
+    REGION=$(yq -r '."gcp-pkg".seed.region // "us-central1"' "$COMPONENT_CONF")
+    GCP_ORG_ID=$(yq -r '."gcp-pkg".seed.org_id // null' "$COMPONENT_CONF")
+    if [ "$GCP_ORG_ID" = "null" ]; then
+        GCP_ORG_ID=""
+    fi
+
+    # Environment tag from seed.project.environment
+    ENV_TAG_VALUE=$(yq -r '."gcp-pkg".seed.project.environment // "Development"' "$COMPONENT_CONF")
+
+    AUTH_METHOD=$(yq -r '."gcp-pkg".seed.auth_method // "impersonation"' "$COMPONENT_CONF")
+    _tmp=$(yq -r '."gcp-pkg".seed.state_bucket // ""' "$COMPONENT_CONF")
+    TF_STATE_BUCKET="${_tmp:-tf-state-${PROJECT_ID}}"
+
+    COMPONENT_SECRETS_CONF=$(_find_component_config "${COMP_NAME}_secrets") || exit 1
+
+    COMPONENT_SECRETS=$(sops -d "$COMPONENT_SECRETS_CONF")
+    GCP_BILLING_ID=$(echo "$COMPONENT_SECRETS" | yq -r '."gcp-pkg_secrets".seed.billing_id')
+    SA_NAME=$(echo "$COMPONENT_SECRETS" | yq -r '."gcp-pkg_secrets".seed.sa_name // "terragrunt-sa"')
+
+    ############################################################################
+    # Derived Vars
+    ############################################################################
+
+    export KEY_DIR="$_CONFIG_TMP_DIR/seed/gcp/gcp-credentials"
+    export KEY_FILE="$KEY_DIR/tf-sa-key.json"
+    export GOOGLE_APPLICATION_CREDENTIALS="$KEY_FILE"
+    export SA_EMAIL="${SA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com"
+
+    ORG_FLAG=""
+    if [[ -n "$GCP_ORG_ID" ]]; then
+        ORG_FLAG="--organization=$GCP_ORG_ID"
+    fi
+
+    BIN_DIR="$HOME/bin-local"
+    SEP='################################################################################'
+}
+
+################################################################################
+# GCP CORE LOGIC
+################################################################################
+
+# Find the GCP package SOPS secrets file.
+_sops_lab_stack_secrets_file() {
+    echo "${_INFRA_DIR}/gcp-pkg/_config/gcp-pkg_secrets.sops.yaml"
+}
+
+# Check whether the private_key_id stored in KEY_FILE still exists as an active
+# SA key in GCP. Returns 0 if valid, 1 if the key is gone or KEY_FILE is unreadable.
+# Does not change the active gcloud account.
+_sa_key_valid() {
+    local key_id
+    key_id=$(jq -r '.private_key_id // empty' "$KEY_FILE" 2>/dev/null || true)
+    [ -z "$key_id" ] && return 1
+    gcloud iam service-accounts keys describe "$key_id" \
+        --iam-account="$SA_EMAIL" \
+        --project "$PROJECT_ID" &>/dev/null
+}
+
+# Write the SA key JSON from KEY_FILE into SOPS under providers.gcp.credentials.
+# The Google provider accepts inline JSON, so downstream Terragrunt units can use it
+# without needing the local key file to be present.
+_write_sa_key_to_sops() {
+    local key_json_encoded
+    # Compact-encode the JSON key, then JSON-encode that string so config-mgr
+    # receives a YAML double-quoted scalar (e.g. "{\"type\":\"service_account\",...}").
+    key_json_encoded=$(jq -c . "$KEY_FILE" | python3 -c 'import sys, json; print(json.dumps(sys.stdin.read().strip()))')
+    "$_CONFIG_MGR" set-raw gcp-pkg gcp-pkg_secrets.providers.gcp.credentials "$key_json_encoded" --sops
+    echo "  ✅ GCP SA key synced to SOPS (providers.gcp.credentials)."
+}
+
+# Blank GCP credentials in SOPS (called from clean-all when auth_method=keyfile).
+_clear_sa_key_from_sops() {
+    "$_CONFIG_MGR" set-raw gcp-pkg gcp-pkg_secrets.providers.gcp.credentials '""' --sops 2>/dev/null || true
+    echo "✅ GCP SOPS credentials cleared."
+}
+
+# Delete all existing user-managed SA keys, create a fresh one, and sync SOPS.
+_create_sa_key() {
+    mkdir -p "$KEY_DIR" && chmod 700 "$KEY_DIR"
+
+    # Clean up stale keys to avoid hitting the per-SA key limit (max 10).
+    local existing_keys
+    existing_keys=$(gcloud iam service-accounts keys list \
+        --iam-account="$SA_EMAIL" \
+        --project "$PROJECT_ID" \
+        --filter="keyType=USER_MANAGED" \
+        --format="value(name)" 2>/dev/null || true)
+    if [[ -n "$existing_keys" ]]; then
+        echo "  Removing stale SA keys before creating new one..."
+        echo "$existing_keys" | while IFS= read -r key_name; do
+            [[ -n "$key_name" ]] || continue
+            gcloud iam service-accounts keys delete "$key_name" \
+                --iam-account="$SA_EMAIL" --project "$PROJECT_ID" --quiet 2>/dev/null || true
+        done
+    fi
+
+    sleep 3  # brief pause for key deletion to propagate
+    if gcloud iam service-accounts keys create "$KEY_FILE" \
+            --iam-account="$SA_EMAIL" \
+            --project "$PROJECT_ID" 2>/dev/null; then
+        chmod 600 "$KEY_FILE"
+        export GOOGLE_APPLICATION_CREDENTIALS="$KEY_FILE"
+        _write_sa_key_to_sops
+    else
+        echo ""
+        echo "❌ Failed to create service account key."
+        echo "An admin may need to allow SA key creation:"
+        echo "  gcloud resource-manager org-policies set-policy allow-sa-keys.yaml --project=$PROJECT_ID"
+        echo "Or change auth_method to 'impersonation' in your config (recommended)."
+        echo ""
+        exit 1
+    fi
+}
+
+check_project() {
+    echo "Verifying GCP authentication..."
+    if ! command -v gcloud &> /dev/null; then install_tools; fi
+
+    if ! gcloud auth list --filter=status:ACTIVE --format="value(account)" | grep -q "@"; then
+        echo "❌ No active GCP authentication found. Please run 'gcloud auth login' first."
+        exit 1
+    fi
+
+    ACTIVE_ACCOUNT=$(gcloud auth list --filter=status:ACTIVE --format="value(account)" | head -n1)
+    echo "✅ Authenticated as: $ACTIVE_ACCOUNT"
+}
+
+install_tools() {
+    echo "Verifying local toolchain..."
+    mkdir -p "$BIN_DIR"
+    if [[ ":$PATH:" != *":$BIN_DIR:"* ]]; then export PATH="$BIN_DIR:$PATH"; fi
+
+    # gcloud (Google Cloud CLI)
+    if ! command -v gcloud &> /dev/null; then
+        echo "Installing Google Cloud CLI..."
+        if [ -f /etc/os-release ]; then
+            . /etc/os-release
+            if [[ "$ID" == "ubuntu" || "$ID" == "pop" || "$ID_LIKE" == *"ubuntu"* ]]; then
+                sudo apt-get update && sudo apt-get install -y apt-transport-https ca-certificates gnupg curl unzip jq
+                curl https://packages.cloud.google.com/apt/doc/apt-key.gpg | sudo gpg --dearmor -o /usr/share/keyrings/cloud.google.gpg
+                echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] https://packages.cloud.google.com/apt cloud-sdk main" | sudo tee /etc/apt/sources.list.d/google-cloud-sdk.list
+                sudo apt-get update && sudo apt-get install -y google-cloud-cli
+            fi
+        fi
+    fi
+
+    # Tofu
+    LATEST_TOFU=$(curl -s https://api.github.com/repos/opentofu/opentofu/releases/latest | jq -r .tag_name | sed 's/^v//')
+    CURRENT_TOFU=$([[ -x $(command -v tofu) ]] && tofu version --json | jq -r .terraform_version || echo "none")
+    if [ "$LATEST_TOFU" != "$CURRENT_TOFU" ]; then
+        echo "Updating OpenTofu: $CURRENT_TOFU -> $LATEST_TOFU"
+        curl -LO "https://github.com/opentofu/opentofu/releases/download/v${LATEST_TOFU}/tofu_${LATEST_TOFU}_linux_amd64.zip"
+        unzip -o "tofu_${LATEST_TOFU}_linux_amd64.zip" tofu
+        mv tofu "$BIN_DIR/"
+        rm "tofu_${LATEST_TOFU}_linux_amd64.zip"
+    else
+        echo "✅ OpenTofu is up to date ($CURRENT_TOFU)."
+    fi
+
+    # Terragrunt
+    LATEST_TG=$(curl -s https://api.github.com/repos/gruntwork-io/terragrunt/releases/latest | jq -r .tag_name)
+    if [[ "$([[ -x $(command -v terragrunt) ]] && terragrunt --version | awk '{print $3}' || echo "")" != "$LATEST_TG" ]]; then
+        curl -Lo "$BIN_DIR/terragrunt" "https://github.com/gruntwork-io/terragrunt/releases/download/${LATEST_TG}/terragrunt_linux_amd64"
+        chmod +x "$BIN_DIR/terragrunt"
+    fi
+
+    gcloud projects list
+}
+
+################################################################################
+# WORKLOAD IDENTITY FEDERATION SETUP
+################################################################################
+
+function setup_workload_identity_federation() {
+    echo ""
+    echo "═══════════════════════════════════════════════════════════════════"
+    echo "SETTING UP WORKLOAD IDENTITY FEDERATION"
+    echo "═══════════════════════════════════════════════════════════════════"
+    echo ""
+
+    # Get WIF configuration from YAML
+    local WIF_ENABLED=$(cat "$COMPONENT_CONF" | yq -r '."gcp-pkg".seed.wif.enabled // false')
+
+    if [[ "$WIF_ENABLED" != "true" ]]; then
+        echo "⚠️  Workload Identity Federation not enabled in config."
+        echo "To enable WIF, add to gcp_seed.yaml:"
+        echo ""
+        echo "  wif:"
+        echo "    enabled: true"
+        echo "    pool_id: \"cicd-pool\""
+        echo "    provider_id: \"cicd-provider\""
+        echo "    platform: \"github\"  # github, gitlab, circleci, bitbucket, generic"
+        echo "    # Platform-specific configuration..."
+        echo ""
+        return 0
+    fi
+
+    local POOL_ID=$(cat "$COMPONENT_CONF" | yq -r '."gcp-pkg".seed.wif.pool_id // "cicd-pool"')
+    local PROVIDER_ID=$(cat "$COMPONENT_CONF" | yq -r '."gcp-pkg".seed.wif.provider_id // "cicd-provider"')
+    local PLATFORM=$(cat "$COMPONENT_CONF" | yq -r '."gcp-pkg".seed.wif.platform // "github"')
+
+    # Get project number (needed for WIF)
+    echo "Retrieving project number..."
+    PROJECT_NUMBER=$(gcloud projects describe "$PROJECT_ID" --format="value(projectNumber)")
+    echo "✅ Project number: $PROJECT_NUMBER"
+
+    # Platform-specific configuration
+    local ISSUER_URI
+    local ATTRIBUTE_MAPPING
+    local ATTRIBUTE_CONDITION
+    local MEMBER_FILTER
+    local DISPLAY_NAME
+
+    case "$PLATFORM" in
+        github)
+            echo "Platform: GitHub Actions"
+            local GITHUB_ORG=$(cat "$COMPONENT_CONF" | yq -r '."gcp-pkg".seed.wif.github_org // ""')
+            local GITHUB_REPO=$(cat "$COMPONENT_CONF" | yq -r '."gcp-pkg".seed.wif.github_repo // ""')
+
+            if [[ -z "$GITHUB_ORG" ]]; then
+                echo "❌ Error: github_org is required for GitHub platform"
+                return 1
+            fi
+
+            ISSUER_URI="https://token.actions.githubusercontent.com"
+            ATTRIBUTE_MAPPING="google.subject=assertion.sub,attribute.actor=assertion.actor,attribute.repository=assertion.repository,attribute.repository_owner=assertion.repository_owner"
+            DISPLAY_NAME="GitHub Actions Pool"
+
+            if [[ -n "$GITHUB_REPO" ]]; then
+                ATTRIBUTE_CONDITION="assertion.repository=='${GITHUB_ORG}/${GITHUB_REPO}'"
+                MEMBER_FILTER="attribute.repository/${GITHUB_ORG}/${GITHUB_REPO}"
+                echo "   Restricting to repository: $GITHUB_ORG/$GITHUB_REPO"
+            else
+                ATTRIBUTE_CONDITION="assertion.repository_owner=='${GITHUB_ORG}'"
+                MEMBER_FILTER="attribute.repository_owner/${GITHUB_ORG}"
+                echo "   Allowing all repositories in organization: $GITHUB_ORG"
+            fi
+            ;;
+        gitlab)
+            echo "Platform: GitLab CI"
+            local GITLAB_GROUP=$(cat "$COMPONENT_CONF" | yq -r '."gcp-pkg".seed.wif.gitlab_group // ""')
+            local GITLAB_PROJECT=$(cat "$COMPONENT_CONF" | yq -r '."gcp-pkg".seed.wif.gitlab_project // ""')
+            local GITLAB_URL=$(cat "$COMPONENT_CONF" | yq -r '."gcp-pkg".seed.wif.gitlab_url // "https://gitlab.com"')
+
+            if [[ -z "$GITLAB_GROUP" ]]; then
+                echo "❌ Error: gitlab_group is required for GitLab platform"
+                return 1
+            fi
+
+            ISSUER_URI="${GITLAB_URL}"
+            ATTRIBUTE_MAPPING="google.subject=assertion.sub,attribute.project_path=assertion.project_path,attribute.namespace_path=assertion.namespace_path,attribute.ref=assertion.ref"
+            DISPLAY_NAME="GitLab CI Pool"
+
+            if [[ -n "$GITLAB_PROJECT" ]]; then
+                ATTRIBUTE_CONDITION="assertion.project_path=='${GITLAB_GROUP}/${GITLAB_PROJECT}'"
+                MEMBER_FILTER="attribute.project_path/${GITLAB_GROUP}/${GITLAB_PROJECT}"
+                echo "   Restricting to project: $GITLAB_GROUP/$GITLAB_PROJECT"
+            else
+                ATTRIBUTE_CONDITION="assertion.namespace_path.startsWith('${GITLAB_GROUP}')"
+                MEMBER_FILTER="attribute.namespace_path/${GITLAB_GROUP}"
+                echo "   Allowing all projects in group: $GITLAB_GROUP"
+            fi
+            ;;
+        circleci)
+            echo "Platform: CircleCI"
+            local CIRCLECI_ORG=$(cat "$COMPONENT_CONF" | yq -r '."gcp-pkg".seed.wif.circleci_org // ""')
+            local CIRCLECI_PROJECT=$(cat "$COMPONENT_CONF" | yq -r '."gcp-pkg".seed.wif.circleci_project // ""')
+
+            if [[ -z "$CIRCLECI_ORG" ]]; then
+                echo "❌ Error: circleci_org is required for CircleCI platform"
+                return 1
+            fi
+
+            ISSUER_URI="https://oidc.circleci.com/org/${CIRCLECI_ORG}"
+            ATTRIBUTE_MAPPING="google.subject=assertion.sub,attribute.project_id=assertion['oidc.circleci.com/project-id']"
+            DISPLAY_NAME="CircleCI Pool"
+
+            if [[ -n "$CIRCLECI_PROJECT" ]]; then
+                ATTRIBUTE_CONDITION="assertion['oidc.circleci.com/project-id']=='${CIRCLECI_PROJECT}'"
+                MEMBER_FILTER="attribute.project_id/${CIRCLECI_PROJECT}"
+                echo "   Restricting to project: $CIRCLECI_PROJECT"
+            else
+                ATTRIBUTE_CONDITION=""
+                MEMBER_FILTER="*"
+                echo "   Allowing all projects in organization: $CIRCLECI_ORG"
+            fi
+            ;;
+        bitbucket)
+            echo "Platform: Bitbucket Pipelines"
+            local BITBUCKET_WORKSPACE=$(cat "$COMPONENT_CONF" | yq -r '."gcp-pkg".seed.wif.bitbucket_workspace // ""')
+            local BITBUCKET_REPO=$(cat "$COMPONENT_CONF" | yq -r '."gcp-pkg".seed.wif.bitbucket_repo // ""')
+
+            if [[ -z "$BITBUCKET_WORKSPACE" ]]; then
+                echo "❌ Error: bitbucket_workspace is required for Bitbucket platform"
+                return 1
+            fi
+
+            ISSUER_URI="https://api.bitbucket.org/2.0/workspaces/${BITBUCKET_WORKSPACE}/pipelines-config/identity/oidc"
+            ATTRIBUTE_MAPPING="google.subject=assertion.sub,attribute.repository=assertion.repositoryUuid,attribute.workspace=assertion.workspaceUuid"
+            DISPLAY_NAME="Bitbucket Pipelines Pool"
+
+            if [[ -n "$BITBUCKET_REPO" ]]; then
+                ATTRIBUTE_CONDITION="assertion.repositoryUuid=='${BITBUCKET_REPO}'"
+                MEMBER_FILTER="attribute.repository/${BITBUCKET_REPO}"
+                echo "   Restricting to repository UUID: $BITBUCKET_REPO"
+            else
+                ATTRIBUTE_CONDITION="assertion.workspaceUuid=='${BITBUCKET_WORKSPACE}'"
+                MEMBER_FILTER="attribute.workspace/${BITBUCKET_WORKSPACE}"
+                echo "   Allowing all repositories in workspace: $BITBUCKET_WORKSPACE"
+            fi
+            ;;
+        generic)
+            echo "Platform: Generic OIDC"
+            local OIDC_ISSUER=$(cat "$COMPONENT_CONF" | yq -r '."gcp-pkg".seed.wif.oidc_issuer // ""')
+            local OIDC_SUBJECT_CLAIM=$(cat "$COMPONENT_CONF" | yq -r '."gcp-pkg".seed.wif.oidc_subject_claim // "sub"')
+
+            if [[ -z "$OIDC_ISSUER" ]]; then
+                echo "❌ Error: oidc_issuer is required for generic platform"
+                return 1
+            fi
+
+            ISSUER_URI="$OIDC_ISSUER"
+            ATTRIBUTE_MAPPING="google.subject=assertion.${OIDC_SUBJECT_CLAIM}"
+            ATTRIBUTE_CONDITION=""
+            MEMBER_FILTER="*"
+            DISPLAY_NAME="Generic OIDC Pool"
+
+            echo "   Using custom OIDC issuer: $OIDC_ISSUER"
+            ;;
+        *)
+            echo "❌ Error: Unknown platform '$PLATFORM'"
+            echo "Supported platforms: github, gitlab, circleci, bitbucket, generic"
+            return 1
+            ;;
+    esac
+
+    # Step 1: Create Workload Identity Pool
+    echo ""
+    echo "Step 1: Creating Workload Identity Pool..."
+    if gcloud iam workload-identity-pools describe "$POOL_ID" \
+        --location=global \
+        --project="$PROJECT_ID" &>/dev/null; then
+        echo "✅ Workload Identity Pool '$POOL_ID' already exists."
+    else
+        echo "Creating Workload Identity Pool: $POOL_ID"
+        if gcloud iam workload-identity-pools create "$POOL_ID" \
+            --location=global \
+            --project="$PROJECT_ID" \
+            --display-name="$DISPLAY_NAME" \
+            --description="Pool for $PLATFORM OIDC authentication"; then
+            echo "✅ Workload Identity Pool created."
+            sleep 5
+        else
+            echo "❌ Failed to create Workload Identity Pool"
+            return 1
+        fi
+    fi
+
+    # Step 2: Create OIDC Provider
+    echo ""
+    echo "Step 2: Creating OIDC Provider..."
+    if gcloud iam workload-identity-pools providers describe "$PROVIDER_ID" \
+        --location=global \
+        --workload-identity-pool="$POOL_ID" \
+        --project="$PROJECT_ID" &>/dev/null; then
+        echo "✅ OIDC Provider '$PROVIDER_ID' already exists."
+    else
+        echo "Creating OIDC Provider: $PROVIDER_ID"
+
+        # Build command with optional attribute condition
+        local CREATE_CMD="gcloud iam workload-identity-pools providers create-oidc \"$PROVIDER_ID\" \
+            --location=global \
+            --workload-identity-pool=\"$POOL_ID\" \
+            --project=\"$PROJECT_ID\" \
+            --issuer-uri=\"$ISSUER_URI\" \
+            --attribute-mapping=\"$ATTRIBUTE_MAPPING\""
+
+        if [[ -n "$ATTRIBUTE_CONDITION" ]]; then
+            CREATE_CMD="$CREATE_CMD --attribute-condition=\"$ATTRIBUTE_CONDITION\""
+        fi
+
+        if eval $CREATE_CMD; then
+            echo "✅ OIDC Provider created."
+            sleep 5
+        else
+            echo "❌ Failed to create OIDC Provider"
+            return 1
+        fi
+    fi
+
+    # Step 3: Bind Service Account to WIF
+    echo ""
+    echo "Step 3: Binding Service Account to Workload Identity..."
+
+    WIF_MEMBER="principalSet://iam.googleapis.com/projects/${PROJECT_NUMBER}/locations/global/workloadIdentityPools/${POOL_ID}/${MEMBER_FILTER}"
+
+    # Check if binding already exists
+    EXISTING_BINDING=$(gcloud iam service-accounts get-iam-policy "$SA_EMAIL" \
+        --project="$PROJECT_ID" \
+        --flatten="bindings[].members" \
+        --filter="bindings.members:'principalSet://iam.googleapis.com/projects/${PROJECT_NUMBER}/locations/global/workloadIdentityPools/${POOL_ID}/*'" \
+        --format="value(bindings.members)" 2>/dev/null || echo "")
+
+    if [[ -n "$EXISTING_BINDING" ]]; then
+        echo "✅ Workload Identity binding already exists."
+    else
+        echo "Creating Workload Identity binding..."
+        if gcloud iam service-accounts add-iam-policy-binding "$SA_EMAIL" \
+            --project="$PROJECT_ID" \
+            --role="roles/iam.workloadIdentityUser" \
+            --member="$WIF_MEMBER"; then
+            echo "✅ Workload Identity binding created."
+        else
+            echo "❌ Failed to create Workload Identity binding"
+            return 1
+        fi
+    fi
+
+    # Step 4: Display platform-specific configuration
+    echo ""
+    echo "═══════════════════════════════════════════════════════════════════"
+    echo "✅ WORKLOAD IDENTITY FEDERATION SETUP COMPLETE"
+    echo "═══════════════════════════════════════════════════════════════════"
+    echo ""
+
+    # Output platform-specific usage instructions
+    output_platform_config "$PLATFORM" "$PROJECT_NUMBER" "$POOL_ID" "$PROVIDER_ID" "$SA_EMAIL"
+
+    echo ""
+    echo "═══════════════════════════════════════════════════════════════════"
+    echo ""
+}
+
+function cleanup_workload_identity() {
+    echo ""
+    echo "Cleaning up Workload Identity Federation resources..."
+
+    local WIF_ENABLED=$(cat "$COMPONENT_CONF" | yq -r '."gcp-pkg".seed.wif.enabled // false')
+    if [[ "$WIF_ENABLED" != "true" ]]; then
+        echo "⚠️  WIF not enabled, skipping cleanup."
+        return 0
+    fi
+
+    local POOL_ID=$(cat "$COMPONENT_CONF" | yq -r '."gcp-pkg".seed.wif.pool_id // "cicd-pool"')
+    local PROVIDER_ID=$(cat "$COMPONENT_CONF" | yq -r '."gcp-pkg".seed.wif.provider_id // "cicd-provider"')
+
+    # Delete provider first
+    if gcloud iam workload-identity-pools providers describe "$PROVIDER_ID" \
+        --location=global \
+        --workload-identity-pool="$POOL_ID" \
+        --project="$PROJECT_ID" &>/dev/null; then
+        echo "Deleting WIF Provider: $PROVIDER_ID"
+        gcloud iam workload-identity-pools providers delete "$PROVIDER_ID" \
+            --location=global \
+            --workload-identity-pool="$POOL_ID" \
+            --project="$PROJECT_ID" \
+            --quiet || echo "⚠️  Failed to delete provider"
+        sleep 3
+    fi
+
+    # Delete pool
+    if gcloud iam workload-identity-pools describe "$POOL_ID" \
+        --location=global \
+        --project="$PROJECT_ID" &>/dev/null; then
+        echo "Deleting WIF Pool: $POOL_ID"
+        gcloud iam workload-identity-pools delete "$POOL_ID" \
+            --location=global \
+            --project="$PROJECT_ID" \
+            --quiet || echo "⚠️  Failed to delete pool"
+    fi
+
+    echo "✅ WIF cleanup complete."
+}
+
+setup_gcp() {
+    echo "Syncing GCP Seed Resources..."
+
+    # Ensure authenticated with proper permissions
+    if ! gcloud auth list --filter=status:ACTIVE --format="value(account)" | grep -q "@"; then
+        echo "No active authentication found. Initiating login..."
+        gcloud auth login
+    fi
+
+    # Display active account
+    ACTIVE_ACCOUNT=$(gcloud auth list --filter=status:ACTIVE --format="value(account)" | head -n1)
+    echo "Active account: $ACTIVE_ACCOUNT"
+
+    # Verify organization access if org_id is provided
+    if [[ -n "$GCP_ORG_ID" ]]; then
+        echo "Organization ID: $GCP_ORG_ID"
+        if ! gcloud organizations describe "$GCP_ORG_ID" &>/dev/null; then
+            echo "❌ Cannot access organization $GCP_ORG_ID"
+            echo "Please ensure your account has permissions in this organization."
+            exit 1
+        fi
+        echo "✅ Organization access verified."
+        # Check if we have Project Creator role
+        echo "Checking Project Creator permissions..."
+        HAS_PROJECT_CREATOR=$(gcloud organizations get-iam-policy "$GCP_ORG_ID" \
+            --flatten="bindings[].members" \
+            --filter="bindings.role:roles/resourcemanager.projectCreator AND bindings.members:user:$ACTIVE_ACCOUNT" \
+            --format="value(bindings.members)" 2>/dev/null || echo "")
+
+        if [[ -z "$HAS_PROJECT_CREATOR" ]]; then
+            echo "⚠️  Missing Project Creator role. Attempting to grant..."
+            if gcloud organizations add-iam-policy-binding "$GCP_ORG_ID" \
+                --member="user:$ACTIVE_ACCOUNT" \
+                --role="roles/resourcemanager.projectCreator" \
+                --quiet 2>/dev/null; then
+                echo "✅ Project Creator role granted automatically."
+                sleep 3  # Allow IAM propagation
+            else
+                echo ""
+                echo "❌ Unable to grant Project Creator role automatically."
+                echo "An organization admin must run:"
+                echo ""
+                echo "  gcloud organizations add-iam-policy-binding $GCP_ORG_ID \\"
+                echo "    --member='user:$ACTIVE_ACCOUNT' \\"
+                echo "    --role='roles/resourcemanager.projectCreator'"
+                echo ""
+                exit 1
+            fi
+        else
+            echo "✅ Project Creator role already granted."
+        fi
+    fi
+
+    # Check billing account access
+    echo "Verifying billing account access..."
+    if ! gcloud billing accounts describe "$GCP_BILLING_ID" &>/dev/null; then
+        echo "❌ Cannot access billing account: $GCP_BILLING_ID"
+        echo ""
+        echo "You may need to run: gcloud auth application-default login"
+        exit 1
+    fi
+    echo "✅ Billing account access verified."
+    # Check if we have Billing Account User role
+    echo "Checking Billing Account User permissions..."
+    HAS_BILLING_USER=$(gcloud billing accounts get-iam-policy "$GCP_BILLING_ID" \
+        --flatten="bindings[].members" \
+        --filter="bindings.role:roles/billing.user AND bindings.members:user:$ACTIVE_ACCOUNT" \
+        --format="value(bindings.members)" 2>/dev/null || echo "")
+
+    if [[ -z "$HAS_BILLING_USER" ]]; then
+        echo "⚠️  Missing Billing Account User role. Attempting to grant..."
+        if gcloud billing accounts add-iam-policy-binding "$GCP_BILLING_ID" \
+            --member="user:$ACTIVE_ACCOUNT" \
+            --role="roles/billing.user" \
+            --quiet 2>/dev/null; then
+            echo "✅ Billing Account User role granted automatically."
+            sleep 3  # Allow IAM propagation
+        else
+            echo ""
+            echo "❌ Unable to grant Billing Account User role automatically."
+            echo "A billing account administrator must run:"
+            echo ""
+            echo "  gcloud billing accounts add-iam-policy-binding $GCP_BILLING_ID \\"
+            echo "    --member='user:$ACTIVE_ACCOUNT' \\"
+            echo "    --role='roles/billing.user'"
+            echo ""
+            exit 1
+        fi
+    else
+        echo "✅ Billing Account User role already granted."
+    fi
+
+    # 1. Project Creation (using project_id from YAML config)
+    # The project_id is loaded from gcp_seed.yaml at the top of the script
+    if ! gcloud projects describe "$PROJECT_ID" &>/dev/null; then
+        echo "Creating GCP Project: $PROJECT_ID..."
+
+        # Create project with organization if specified
+        if [[ -n "$GCP_ORG_ID" ]]; then
+            echo "Creating project in organization: $GCP_ORG_ID"
+            if ! gcloud projects create "$PROJECT_ID" --organization="$GCP_ORG_ID"; then
+                echo "❌ Failed to create project in organization."
+                echo "Required permission: resourcemanager.projects.create on organization $GCP_ORG_ID"
+                exit 1
+            fi
+        else
+            echo "Creating project without organization (personal account)"
+            gcloud projects create "$PROJECT_ID"
+        fi
+
+        echo "Waiting for project to propagate..."
+        sleep 5
+
+        # Wait for project to be fully available
+        for i in {1..10}; do
+            if gcloud projects describe "$PROJECT_ID" &>/dev/null; then
+                echo "✅ Project created and ready."
+                break
+            fi
+            echo "Waiting for project to be fully available... ($i/10)"
+            sleep 3
+        done
+    else
+        echo "✅ GCP Project $PROJECT_ID already exists."
+    fi
+
+    # Set the project context
+    gcloud config set project "$PROJECT_ID" 2>/dev/null
+
+    # 1.5. Apply Environment Tag (if in organization)
+    if [[ -n "$GCP_ORG_ID" ]]; then
+        echo "Checking environment tag permissions and configuration..."
+
+        # Default environment value if not specified in config
+        ENV_TAG_VALUE=${ENV_TAG_VALUE:-"Development"}
+        TAG_KEY="environment"
+        TAG_PARENT="organizations/$GCP_ORG_ID"
+        TAG_ID="${TAG_PARENT}/tagKeys/${TAG_KEY}"
+        TAG_VALUE_ID="${TAG_ID}/tagValues/${ENV_TAG_VALUE}"
+
+        # Check if user has Tag Admin role
+        echo "Checking Tag Admin permissions..."
+        HAS_TAG_ADMIN=$(gcloud organizations get-iam-policy "$GCP_ORG_ID" \
+            --flatten="bindings[].members" \
+            --filter="bindings.role:roles/resourcemanager.tagAdmin AND bindings.members:user:$ACTIVE_ACCOUNT" \
+            --format="value(bindings.members)" 2>/dev/null || echo "")
+
+        TAG_OPERATIONS_ENABLED=true
+
+        if [[ -z "$HAS_TAG_ADMIN" ]]; then
+            echo "⚠️  Missing Tag Admin role. Attempting to grant automatically..."
+
+            # Attempt to grant Tag Admin role
+            if gcloud organizations add-iam-policy-binding "$GCP_ORG_ID" \
+                --member="user:$ACTIVE_ACCOUNT" \
+                --role="roles/resourcemanager.tagAdmin" \
+                --quiet 2>/dev/null; then
+                echo "✅ Tag Admin role granted successfully."
+                sleep 3  # Allow IAM propagation
+            else
+                echo "⚠️  Could not grant Tag Admin role automatically."
+                echo ""
+                echo "This means:"
+                echo "  • You don't have permission to manage organization IAM policies"
+                echo "  • An organization admin needs to grant you Tag Admin role"
+                echo "  • OR an admin needs to create the tags manually"
+                echo ""
+                echo "Option 1 - Grant yourself Tag Admin (requires Org Admin):"
+                echo "  gcloud organizations add-iam-policy-binding $GCP_ORG_ID \\"
+                echo "    --member='user:$ACTIVE_ACCOUNT' \\"
+                echo "    --role='roles/resourcemanager.tagAdmin'"
+                echo ""
+                echo "Option 2 - Have admin create tags manually (see instructions below)"
+                echo ""
+                TAG_OPERATIONS_ENABLED=false
+            fi
+        else
+            echo "✅ Tag Admin role already granted."
+        fi
+
+        # Only attempt tag operations if we have or got permissions
+        if [[ "$TAG_OPERATIONS_ENABLED" == "true" ]]; then
+            # Check if tag key exists, create if needed
+            echo "Checking for tag key 'environment'..."
+            if gcloud resource-manager tags keys describe "$TAG_KEY" --parent="$TAG_PARENT" &>/dev/null; then
+                echo "✅ Tag key 'environment' already exists."
+            else
+                echo "Creating tag key 'environment'..."
+                # Try to create the tag key
+                CREATE_RESULT=0
+                CREATE_OUTPUT=$(gcloud resource-manager tags keys create "$TAG_KEY" \
+                    --parent="$TAG_PARENT" \
+                    --description="Environment designation for project lifecycle" \
+                    --quiet 2>&1) || CREATE_RESULT=$?
+
+                if [[ $CREATE_RESULT -eq 0 ]]; then
+                    echo "✅ Tag key 'environment' created."
+                    sleep 2
+                elif echo "$CREATE_OUTPUT" | grep -q "ALREADY_EXISTS"; then
+                    echo "✅ Tag key 'environment' already exists (confirmed via creation attempt)."
+                    sleep 2
+                else
+                    echo "⚠️  Could not create or verify tag key."
+                    echo "Error: $CREATE_OUTPUT"
+                    TAG_OPERATIONS_ENABLED=false
+                fi
+            fi
+
+            # Check if tag value exists, create if needed
+            if [[ "$TAG_OPERATIONS_ENABLED" == "true" ]]; then
+                # Try to get the tag key name (full resource name like tagKeys/12345)
+                TAG_KEY_NAME=$(gcloud resource-manager tags keys describe "$TAG_KEY" --parent="$TAG_PARENT" --format="value(name)" 2>/dev/null || echo "")
+
+                # If describe fails, try to list and find it by short name
+                if [[ -z "$TAG_KEY_NAME" ]]; then
+                    echo "⚠️  Could not describe tag key directly, searching in list..."
+
+                    # Check if jq is available, install if needed
+                    if ! command -v jq &>/dev/null; then
+                        echo "⏳ Installing jq for JSON parsing..."
+                        if command -v apt-get &>/dev/null; then
+                            sudo apt-get update &>/dev/null && sudo apt-get install -y jq &>/dev/null
+                        elif command -v yum &>/dev/null; then
+                            sudo yum install -y jq &>/dev/null
+                        fi
+                    fi
+
+                    # List all tag keys and filter by shortName
+                    if command -v jq &>/dev/null; then
+                        TAG_KEY_NAME=$(gcloud resource-manager tags keys list --parent="$TAG_PARENT" --format="json" 2>/dev/null | \
+                            jq -r ".[] | select(.shortName == \"$TAG_KEY\") | .name" 2>/dev/null | head -n1 || echo "")
+                    else
+                        # Fallback without jq - use grep on yaml output
+                        TAG_KEY_NAME=$(gcloud resource-manager tags keys list --parent="$TAG_PARENT" --format="yaml" 2>/dev/null | \
+                            grep -A1 "shortName: $TAG_KEY" | grep "name:" | awk '{print $2}' | head -n1 || echo "")
+                    fi
+                fi
+
+                # If still not found but we know it exists (from ALREADY_EXISTS error), construct a fallback
+                if [[ -z "$TAG_KEY_NAME" ]]; then
+                    echo "⚠️  Could not retrieve tag key via list, attempting direct construction..."
+                    # Try to get any tag key to understand the naming pattern
+                    SAMPLE_TAG=$(gcloud resource-manager tags keys list --parent="$TAG_PARENT" --limit=1 --format="value(name)" 2>/dev/null | head -n1 || echo "")
+                    if [[ -n "$SAMPLE_TAG" ]]; then
+                        # Extract the numeric ID pattern if possible
+                        echo "   Found sample tag: $SAMPLE_TAG"
+                    fi
+
+                    # Try one more time with a longer wait for IAM propagation
+                    echo "⏳ Waiting 10 seconds for IAM permissions to propagate..."
+                    sleep 10
+                    TAG_KEY_NAME=$(gcloud resource-manager tags keys describe "$TAG_KEY" --parent="$TAG_PARENT" --format="value(name)" 2>/dev/null || echo "")
+                fi
+
+                if [[ -n "$TAG_KEY_NAME" ]]; then
+                    echo "✅ Retrieved tag key name: $TAG_KEY_NAME"
+                    echo "Checking for tag value '$ENV_TAG_VALUE'..."
+                    if gcloud resource-manager tags values describe "$ENV_TAG_VALUE" --parent="$TAG_KEY_NAME" &>/dev/null; then
+                        echo "✅ Tag value '$ENV_TAG_VALUE' already exists."
+                    else
+                        echo "Creating tag value '$ENV_TAG_VALUE'..."
+                        # Try to create the tag value
+                        CREATE_RESULT=0
+                        CREATE_OUTPUT=$(gcloud resource-manager tags values create "$ENV_TAG_VALUE" \
+                            --parent="$TAG_KEY_NAME" \
+                            --description="$ENV_TAG_VALUE environment" \
+                            --quiet 2>&1) || CREATE_RESULT=$?
+
+                        if [[ $CREATE_RESULT -eq 0 ]]; then
+                            echo "✅ Tag value '$ENV_TAG_VALUE' created."
+                            sleep 2
+                        elif echo "$CREATE_OUTPUT" | grep -q "ALREADY_EXISTS"; then
+                            echo "✅ Tag value '$ENV_TAG_VALUE' already exists (confirmed via creation attempt)."
+                            sleep 2
+                        else
+                            echo "⚠️  Could not create or verify tag value."
+                            echo "Error: $CREATE_OUTPUT"
+                            TAG_OPERATIONS_ENABLED=false
+                        fi
+                    fi
+
+                    # Apply tag to project
+                    if [[ "$TAG_OPERATIONS_ENABLED" == "true" ]]; then
+                        # Try to get the tag value name (full resource name like tagValues/67890)
+                        TAG_VALUE_NAME=$(gcloud resource-manager tags values describe "$ENV_TAG_VALUE" --parent="$TAG_KEY_NAME" --format="value(name)" 2>/dev/null || echo "")
+
+                        # If describe fails, try to list and find it by short name
+                        if [[ -z "$TAG_VALUE_NAME" ]]; then
+                            echo "⚠️  Could not describe tag value directly, searching in list..."
+
+                            # Try listing with error capture
+                            LIST_OUTPUT=$(gcloud resource-manager tags values list --parent="$TAG_KEY_NAME" --format="json" 2>&1)
+                            LIST_RESULT=$?
+                            if [[ $LIST_RESULT -ne 0 ]]; then
+                                echo "⚠️  Failed to list tag values. Error:"
+                                echo "$LIST_OUTPUT"
+                                echo "   You may need 'roles/resourcemanager.tagViewer' role."
+                            else
+                                # List all tag values and filter by shortName
+                                if command -v jq &>/dev/null; then
+                                    TAG_VALUE_NAME=$(echo "$LIST_OUTPUT" | \
+                                        jq -r ".[] | select(.shortName == \"$ENV_TAG_VALUE\") | .name" 2>/dev/null | head -n1 || echo "")
+                                else
+                                    # Fallback without jq - use grep on yaml output
+                                    LIST_OUTPUT_YAML=$(gcloud resource-manager tags values list --parent="$TAG_KEY_NAME" --format="yaml" 2>/dev/null)
+                                    TAG_VALUE_NAME=$(echo "$LIST_OUTPUT_YAML" | \
+                                        grep -A1 "shortName: $ENV_TAG_VALUE" | grep "name:" | awk '{print $2}' | head -n1 || echo "")
+                                fi
+
+                                if [[ -n "$TAG_VALUE_NAME" ]]; then
+                                    echo "✅ Found tag value in list: $TAG_VALUE_NAME"
+                                else
+                                    echo "⚠️  Tag value '$ENV_TAG_VALUE' not found in list."
+                                fi
+                            fi
+                        fi
+
+                        # If still not found, wait and try one more time
+                        if [[ -z "$TAG_VALUE_NAME" ]]; then
+                            echo "⏳ Waiting 10 seconds for IAM permissions to propagate..."
+                            sleep 10
+                            TAG_VALUE_NAME=$(gcloud resource-manager tags values describe "$ENV_TAG_VALUE" --parent="$TAG_KEY_NAME" --format="value(name)" 2>/dev/null || echo "")
+
+                            if [[ -n "$TAG_VALUE_NAME" ]]; then
+                                echo "✅ Retrieved tag value after waiting: $TAG_VALUE_NAME"
+                            fi
+                        fi
+
+                        if [[ -n "$TAG_VALUE_NAME" ]]; then
+                            echo "✅ Retrieved tag value name: $TAG_VALUE_NAME"
+
+                            # Check and grant Tag User role on the PROJECT (required to attach tags to the project)
+                            # Note: tagUser permission is needed on the RESOURCE being tagged, not on the tag value
+                            echo "Checking Tag User permissions on project..."
+                            HAS_TAG_USER=$(gcloud projects get-iam-policy "$PROJECT_ID" \
+                                --flatten="bindings[].members" \
+                                --filter="bindings.role:roles/resourcemanager.tagUser AND bindings.members:user:$ACTIVE_ACCOUNT" \
+                                --format="value(bindings.members)" 2>/dev/null || echo "")
+
+                            if [[ -z "$HAS_TAG_USER" ]]; then
+                                echo "⚠️  Missing Tag User role on project. Attempting to grant..."
+                                if gcloud projects add-iam-policy-binding "$PROJECT_ID" \
+                                    --member="user:$ACTIVE_ACCOUNT" \
+                                    --role="roles/resourcemanager.tagUser" \
+                                    --quiet 2>/dev/null; then
+                                    echo "✅ Tag User role granted on project."
+                                    sleep 3  # Allow IAM propagation
+                                else
+                                    echo "⚠️  Could not grant Tag User role on project."
+                                    echo "   An admin may need to grant this role."
+                                fi
+                            else
+                                echo "✅ Tag User role already granted on project."
+                            fi
+
+                            # Get project number (required for tag bindings)
+                            PROJECT_NUMBER=$(gcloud projects describe "$PROJECT_ID" --format="value(projectNumber)" 2>/dev/null || echo "")
+
+                            if [[ -z "$PROJECT_NUMBER" ]]; then
+                                echo "⚠️  Could not retrieve project number."
+                                TAG_OPERATIONS_ENABLED=false
+                            else
+                                echo "✅ Retrieved project number: $PROJECT_NUMBER"
+
+                                # Construct the proper resource name for tag bindings
+                                PROJECT_RESOURCE="//cloudresourcemanager.googleapis.com/projects/$PROJECT_NUMBER"
+
+                                # Check if tag binding already exists
+                                EXISTING_TAG=$(gcloud resource-manager tags bindings list \
+                                    --parent="$PROJECT_RESOURCE" \
+                                    --filter="tagValue:$TAG_VALUE_NAME" \
+                                    --format="value(tagValue)" 2>/dev/null || echo "")
+
+                                if [[ -n "$EXISTING_TAG" ]]; then
+                                    echo "✅ Environment tag already applied."
+                                else
+                                    echo "Applying environment tag to project..."
+                                    # Try to create the tag binding
+                                    # Note: Projects are global resources, so we don't specify --location
+                                    CREATE_RESULT=0
+                                    CREATE_OUTPUT=$(gcloud resource-manager tags bindings create \
+                                        --tag-value="$TAG_VALUE_NAME" \
+                                        --parent="$PROJECT_RESOURCE" \
+                                        --quiet 2>&1) || CREATE_RESULT=$?
+
+                                    if [[ $CREATE_RESULT -eq 0 ]]; then
+                                        echo "✅ Environment tag 'environment=$ENV_TAG_VALUE' applied to project."
+                                    elif echo "$CREATE_OUTPUT" | grep -q "ALREADY_EXISTS"; then
+                                        echo "✅ Environment tag already applied (confirmed via creation attempt)."
+                                    else
+                                        echo "⚠️  Could not apply or verify tag binding."
+                                        echo "Error: $CREATE_OUTPUT"
+                                        TAG_OPERATIONS_ENABLED=false
+                                    fi
+                                fi
+                            fi
+                        else
+                            echo "⚠️  Could not retrieve tag value name. Skipping tag binding."
+                            echo ""
+                            echo "═══════════════════════════════════════════════════════════════════"
+                            echo "QUICK FIX - Apply tag manually with these commands:"
+                            echo "═══════════════════════════════════════════════════════════════════"
+                            echo ""
+                            echo "# Get the tag value ID:"
+                            echo "TAG_VALUE=\$(gcloud resource-manager tags values list \\"
+                            echo "  --parent=$TAG_KEY_NAME \\"
+                            echo "  --filter=\"shortName=$ENV_TAG_VALUE\" \\"
+                            echo "  --format=\"value(name)\")"
+                            echo ""
+                            echo "# Get project number:"
+                            echo "PROJECT_NUM=\$(gcloud projects describe $PROJECT_ID --format=\"value(projectNumber)\")"
+                            echo ""
+                            echo "# Grant yourself tagUser role on the project:"
+                            echo "gcloud projects add-iam-policy-binding $PROJECT_ID \\"
+                            echo "  --member=\"user:\$(gcloud config get-value account)\" \\"
+                            echo "  --role=\"roles/resourcemanager.tagUser\""
+                            echo ""
+                            echo "# Apply the tag:"
+                            echo "gcloud resource-manager tags bindings create \\"
+                            echo "  --tag-value=\"\$TAG_VALUE\" \\"
+                            echo "  --parent=\"//cloudresourcemanager.googleapis.com/projects/\$PROJECT_NUM\""
+                            echo ""
+                            echo "═══════════════════════════════════════════════════════════════════"
+                            echo ""
+                            TAG_OPERATIONS_ENABLED=false
+                        fi
+                    fi
+                else
+                    echo "⚠️  Could not retrieve tag key name. Skipping tag value operations."
+                    TAG_OPERATIONS_ENABLED=false
+                fi
+            fi
+        fi
+
+        # Provide manual instructions if any tag operation failed
+        if [[ "$TAG_OPERATIONS_ENABLED" == "false" ]]; then
+            echo ""
+            echo "═══════════════════════════════════════════════════════════════════"
+            echo "MANUAL TAG SETUP INSTRUCTIONS"
+            echo "═══════════════════════════════════════════════════════════════════"
+            echo ""
+            echo "An organization admin needs to run these commands:"
+            echo ""
+            echo "# 1. Create the tag key (run once per organization)"
+            echo "gcloud resource-manager tags keys create environment \\"
+            echo "  --parent=organizations/$GCP_ORG_ID \\"
+            echo "  --description='Environment designation for project lifecycle'"
+            echo ""
+            echo "# 2. Create tag values (run once per organization)"
+            echo "TAG_KEY=\$(gcloud resource-manager tags keys describe environment \\"
+            echo "  --parent=organizations/$GCP_ORG_ID --format='value(name)')"
+            echo ""
+            echo "for ENV in Development Production Staging Test; do"
+            echo "  gcloud resource-manager tags values create \$ENV \\"
+            echo "    --parent=\$TAG_KEY \\"
+            echo "    --description=\"\$ENV environment\""
+            echo "done"
+            echo ""
+            echo "# 3. Apply tag to this project"
+            echo "# First get the project number:"
+            echo "PROJECT_NUMBER=\$(gcloud projects describe $PROJECT_ID --format='value(projectNumber)')"
+            echo ""
+            echo "TAG_VALUE=\$(gcloud resource-manager tags values describe $ENV_TAG_VALUE \\"
+            echo "  --parent=\$TAG_KEY --format='value(name)')"
+            echo ""
+            echo "# Note: Projects are global resources, so no --location flag needed"
+            echo "gcloud resource-manager tags bindings create \\"
+            echo "  --tag-value=\$TAG_VALUE \\"
+            echo "  --parent=\"//cloudresourcemanager.googleapis.com/projects/\$PROJECT_NUMBER\""
+            echo ""
+            echo "═══════════════════════════════════════════════════════════════════"
+            echo ""
+            echo "⚠️  NOTE: Tags are optional. Your project will work without them."
+            echo "   Tags are used for organization, billing reports, and access control."
+            echo ""
+        fi
+    fi
+
+    # 2. Billing Link
+    echo "Checking billing status..."
+    CURRENT_BILLING=$(gcloud billing projects describe "$PROJECT_ID" --format="value(billingAccountName)" 2>/dev/null || echo "")
+
+    if [[ -z "$CURRENT_BILLING" ]]; then
+        echo "Linking billing account: $GCP_BILLING_ID to project: $PROJECT_ID..."
+
+        if ! gcloud billing projects link "$PROJECT_ID" --billing-account="$GCP_BILLING_ID"; then
+            echo "❌ Failed to link billing account."
+            echo ""
+            echo "Required permissions:"
+            echo "  - billing.resourceAssociations.create on billing account $GCP_BILLING_ID"
+            echo "  - resourcemanager.projects.createBillingAssignment on project $PROJECT_ID"
+            echo ""
+            echo "Verify you have 'Billing Account User' role:"
+            echo "  gcloud billing accounts get-iam-policy $GCP_BILLING_ID"
+            exit 1
+        fi
+        echo "✅ Billing linked successfully."
+    elif [[ "$CURRENT_BILLING" == "billingAccounts/$GCP_BILLING_ID" ]]; then
+        echo "✅ Billing already linked to correct account."
+    else
+        echo "⚠️  Billing linked to different account: $CURRENT_BILLING"
+        echo "Expected: billingAccounts/$GCP_BILLING_ID"
+        read -p "Update billing account? (y/n): " UPDATE_BILLING
+        if [[ "$UPDATE_BILLING" == "y" ]]; then
+            gcloud billing projects link "$PROJECT_ID" --billing-account="$GCP_BILLING_ID"
+        fi
+    fi
+
+    # 3. Enable Required APIs
+    echo "Enabling required APIs..."
+    # FIX: Added iamcredentials and sts for impersonation support always
+    REQUIRED_APIS="compute.googleapis.com cloudresourcemanager.googleapis.com iam.googleapis.com storage-api.googleapis.com orgpolicy.googleapis.com iamcredentials.googleapis.com sts.googleapis.com"
+
+    gcloud services enable $REQUIRED_APIS --project "$PROJECT_ID" 2>/dev/null || echo "APIs already enabled or enabling..."
+
+    # 4. Handle Service Account Key Creation Policy (only if using keyfile method)
+    if [[ "$AUTH_METHOD" == "keyfile" ]]; then
+        echo "Authentication method: Service Account Keys"
+        echo "Checking organization policy for service account key creation..."
+
+        # Try to disable at project level first
+        if gcloud resource-manager org-policies delete iam.disableServiceAccountKeyCreation \
+            --project="$PROJECT_ID" 2>/dev/null; then
+            echo "✅ Removed project-level constraint."
+            sleep 3
+        else
+            echo "No project-level constraint found (this is OK)."
+        fi
+
+        # Check if there's an organization-level constraint
+        if [[ -n "$GCP_ORG_ID" ]]; then
+            ORG_POLICY_ENFORCED=$(gcloud resource-manager org-policies describe iam.disableServiceAccountKeyCreation \
+                --organization="$GCP_ORG_ID" \
+                --format="value(booleanPolicy.enforced)" 2>/dev/null || echo "")
+
+            if [[ "$ORG_POLICY_ENFORCED" == "True" ]]; then
+                echo "⚠️  Organization policy blocks service account key creation."
+                echo "Attempting to create project-level exception..."
+
+                # Create a policy file that allows key creation for this project
+                cat > /tmp/allow-sa-keys.yaml <<EOF
+constraint: constraints/iam.disableServiceAccountKeyCreation
+booleanPolicy:
+  enforced: false
+EOF
+
+                if gcloud resource-manager org-policies set-policy /tmp/allow-sa-keys.yaml \
+                    --project="$PROJECT_ID" 2>/dev/null; then
+                    echo "✅ Project-level exception created."
+                    rm /tmp/allow-sa-keys.yaml
+                    sleep 5  # Wait for policy to propagate
+                else
+                    echo ""
+                    echo "❌ Unable to override organization policy automatically."
+                    echo "An organization admin must create a project-level exception:"
+                    echo ""
+                    echo "  cat > allow-sa-keys.yaml <<EOF"
+                    echo "constraint: constraints/iam.disableServiceAccountKeyCreation"
+                    echo "booleanPolicy:"
+                    echo "  enforced: false"
+                    echo "EOF"
+                    echo "  gcloud resource-manager org-policies set-policy allow-sa-keys.yaml --project=$PROJECT_ID"
+                    echo ""
+                    echo "Alternatively, change auth_method to 'impersonation' in your config (recommended)."
+                    echo ""
+                    rm -f /tmp/allow-sa-keys.yaml
+                    exit 1
+                fi
+            else
+                echo "✅ Organization policy allows key creation."
+            fi
+        fi
+    else
+        echo "Authentication method: Workload Identity Federation (Service Account Impersonation)"
+        echo "✅ No service account keys will be created (more secure)."
+    fi
+
+    # 5. Service Account Creation
+    mkdir -p "$KEY_DIR" && chmod 700 "$KEY_DIR"
+
+    if ! gcloud iam service-accounts describe "$SA_EMAIL" --project "$PROJECT_ID" &>/dev/null; then
+        echo "Creating Service Account: $SA_NAME..."
+        gcloud iam service-accounts create "$SA_NAME" \
+            --display-name="Terragrunt Service Account" \
+            --project "$PROJECT_ID"
+
+        echo "Waiting for Service Account to propagate..."
+        for i in {1..15}; do
+            if gcloud iam service-accounts describe "$SA_EMAIL" --project "$PROJECT_ID" &>/dev/null; then
+                echo "✅ Service Account ready."
+                break
+            fi
+            sleep 2
+        done
+    else
+        echo "✅ Service Account $SA_EMAIL already exists."
+    fi
+
+    # 6. IAM Role Bindings (Owner + Additional Provisioning Roles)
+    echo "Configuring IAM roles for service account..."
+
+    # Check and apply Owner role
+    CURRENT_OWNER=$(gcloud projects get-iam-policy "$PROJECT_ID" --flatten="bindings[].members" \
+        --filter="bindings.role:roles/owner AND bindings.members:serviceAccount:$SA_EMAIL" \
+        --format="value(bindings.members)" 2>/dev/null || echo "")
+
+    if [[ -z "$CURRENT_OWNER" ]]; then
+        echo "Applying IAM Owner role..."
+        MAX_RETRIES=5
+        RETRY_COUNT=0
+        until gcloud projects add-iam-policy-binding "$PROJECT_ID" \
+            --member="serviceAccount:$SA_EMAIL" \
+            --role="roles/owner" \
+            --quiet 2>/dev/null; do
+            RETRY_COUNT=$((RETRY_COUNT + 1))
+            if [ $RETRY_COUNT -ge $MAX_RETRIES ]; then
+                echo "❌ Failed to apply IAM policy after $MAX_RETRIES attempts"
+                exit 1
+            fi
+            echo "IAM propagation in progress... retrying in 5s (attempt $RETRY_COUNT/$MAX_RETRIES)"
+            sleep 5
+        done
+
+        echo "✅ Owner role applied."
+    else
+        echo "✅ Owner role already assigned."
+    fi
+
+    # Apply additional roles for resource provisioning
+    # These ensure the SA can create and manage all common GCP resources
+    # AND can be impersonated properly
+    PROVISIONING_ROLES=(
+        "roles/browser"                    # CRITICAL: View basic project info (needed for impersonation)
+        "roles/compute.admin"              # Compute Engine resources
+        "roles/storage.admin"              # Cloud Storage
+        "roles/iam.serviceAccountAdmin"    # Service Account management
+        "roles/resourcemanager.projectIamAdmin"  # Project IAM management
+        "roles/serviceusage.serviceUsageConsumer"  # Query API status (needed for impersonation)
+    )
+
+    for ROLE in "${PROVISIONING_ROLES[@]}"; do
+        ROLE_CHECK=$(gcloud projects get-iam-policy "$PROJECT_ID" --flatten="bindings[].members" \
+            --filter="bindings.role:$ROLE AND bindings.members:serviceAccount:$SA_EMAIL" \
+            --format="value(bindings.members)" 2>/dev/null || echo "")
+
+        if [[ -z "$ROLE_CHECK" ]]; then
+            echo "Applying $ROLE..."
+            gcloud projects add-iam-policy-binding "$PROJECT_ID" \
+                --member="serviceAccount:$SA_EMAIL" \
+                --role="roles/owner" \
+                --quiet 2>/dev/null || echo "⚠️  Could not apply $ROLE (may already be covered by Owner role)"
+        fi
+    done
+
+    echo "✅ All IAM roles configured."
+    # 6.5. Grant Token Creator Role for Impersonation
+    # FIX: ALWAYS grant this permission unless strictly using a keyfile
+    if [[ "$AUTH_METHOD" != "keyfile" ]]; then
+        echo "Checking Service Account Token Creator permissions for impersonation..."
+
+        # FIX: Force grant the role to the active account to ensure Owner has explicit permission
+        echo "Granting Service Account Token Creator role to $ACTIVE_ACCOUNT..."
+        gcloud iam service-accounts add-iam-policy-binding "$SA_EMAIL" \
+            --member="user:$ACTIVE_ACCOUNT" \
+            --role="roles/iam.serviceAccountTokenCreator" \
+            --project "$PROJECT_ID" \
+            --quiet &>/dev/null
+
+        # Poll for IAM propagation instead of sleeping
+        echo "⏳ Waiting for IAM permissions to propagate (this can take 60-80 seconds)..."
+        MAX_WAIT=90
+        ELAPSED=0
+        POLL_INTERVAL=5
+
+        while [ $ELAPSED -lt $MAX_WAIT ]; do
+            # FIX: Use print-access-token to verify the API and role are functional
+            if gcloud auth print-access-token --impersonate-service-account="$SA_EMAIL" &>/dev/null; then
+                echo "✅ IAM permissions propagated after ${ELAPSED}s."
+                break
+            fi
+            sleep $POLL_INTERVAL
+            ELAPSED=$((ELAPSED + POLL_INTERVAL))
+            if [ $((ELAPSED % 15)) -eq 0 ]; then
+                echo "   Still waiting... (${ELAPSED}s elapsed)"
+            fi
+        done
+
+        if [ $ELAPSED -ge $MAX_WAIT ]; then
+            echo "⚠️  IAM propagation taking longer than expected. Continuing anyway..."
+        fi
+    fi
+
+    # 7. Service Account Key (only if using keyfile auth)
+    if [[ "$AUTH_METHOD" == "keyfile" ]]; then
+        if [ ! -f "$KEY_FILE" ]; then
+            echo "KEY_FILE not found — creating Service Account key..."
+            _create_sa_key
+            echo "✅ Key created at $KEY_FILE"
+        elif ! _sa_key_valid; then
+            echo "KEY_FILE exists but its key_id is no longer valid in GCP — recreating..."
+            _create_sa_key
+            echo "✅ Key refreshed at $KEY_FILE"
+        else
+            echo "✅ Service Account key valid (key_id: $(jq -r .private_key_id "$KEY_FILE"))."
+            export GOOGLE_APPLICATION_CREDENTIALS="$KEY_FILE"
+            # Ensure SOPS is in sync even if key did not change.
+            local sops_file
+            sops_file=$(_sops_lab_stack_secrets_file)
+            if [ -n "$sops_file" ]; then
+                local sops_key_id
+                sops_key_id=$(SOPS_AGE_KEY_FILE="$HOME/.sops/age/keys.txt" sops -d "$sops_file" 2>/dev/null \
+                    | python3 -c "
+import yaml, sys, json
+cfg = yaml.safe_load(sys.stdin)
+creds = cfg.get('gcp-pkg_secrets', {}).get('providers', {}).get('gcp', {}).get('credentials', '')
+try:
+    print(json.loads(creds).get('private_key_id', ''))
+except Exception:
+    print('')
+" 2>/dev/null || echo "")
+                if [ "$sops_key_id" != "$(jq -r .private_key_id "$KEY_FILE")" ]; then
+                    echo "  SOPS credentials are out of sync — updating..."
+                    _write_sa_key_to_sops
+                else
+                    echo "✅ SOPS credentials are already in sync."
+                fi
+            fi
+        fi
+    else
+        echo "✅ Using service account impersonation - no key file needed."
+        echo ""
+        echo "To use this service account with Terragrunt/OpenTofu, configure:"
+        echo "  export GOOGLE_IMPERSONATE_SERVICE_ACCOUNT=\"$SA_EMAIL\""
+        echo ""
+        echo "Or in your Terragrunt/Terraform config:"
+        echo "  provider \"google\" {"
+        echo "    impersonate_service_account = \"$SA_EMAIL\""
+        echo "  }"
+        echo ""
+
+        # Verify impersonation works with retries
+        echo "Testing service account impersonation..."
+        MAX_RETRIES=3
+        RETRY_COUNT=0
+        IMPERSONATION_WORKS=false
+
+        while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+            # Test with print-access-token (more reliable than describe for API testing)
+            if gcloud auth print-access-token --impersonate-service-account="$SA_EMAIL" &>/dev/null; then
+                echo "✅ Service account impersonation verified."
+                IMPERSONATION_WORKS=true
+                break
+            else
+                RETRY_COUNT=$((RETRY_COUNT + 1))
+                if [ $RETRY_COUNT -lt $MAX_RETRIES ]; then
+                    echo "⏳ Impersonation test failed. Waiting for IAM propagation (attempt $RETRY_COUNT/$MAX_RETRIES)..."
+                    sleep 20
+                fi
+            fi
+        done
+
+        if [ "$IMPERSONATION_WORKS" = false ]; then
+            echo ""
+            echo "⚠️  Impersonation verification failed after $MAX_RETRIES attempts."
+            echo "This might be normal - IAM permissions can take 60-80 seconds to propagate globally."
+            echo ""
+            echo "Debug information:"
+            echo "  Service Account: $SA_EMAIL"
+            echo "  Your User: $ACTIVE_ACCOUNT"
+            echo ""
+            echo "Please wait 1-2 minutes, then test with:"
+            echo "  ./run --test"
+            echo ""
+            echo "Or test manually:"
+            echo "  gcloud projects describe $PROJECT_ID --impersonate-service-account=$SA_EMAIL"
+            echo "  gcloud storage ls gs://$TF_STATE_BUCKET --impersonate-service-account=$SA_EMAIL"
+            echo ""
+            echo "Verify roles:"
+            echo "  gcloud iam service-accounts get-iam-policy $SA_EMAIL --project=$PROJECT_ID"
+            echo "  gcloud projects get-iam-policy $PROJECT_ID --flatten='bindings[].members' --filter='bindings.members:serviceAccount:$SA_EMAIL'"
+        fi
+    fi
+
+    # 8. GCS Bucket Creation (Idempotent)
+    echo "Checking GCS Bucket: $TF_STATE_BUCKET"
+
+    if ! gcloud storage buckets describe "gs://$TF_STATE_BUCKET" --project "$PROJECT_ID" &>/dev/null; then
+        echo "Creating GCS Bucket: $TF_STATE_BUCKET"
+        gcloud storage buckets create "gs://$TF_STATE_BUCKET" \
+            --project="$PROJECT_ID" \
+            --location="$REGION" \
+            --uniform-bucket-level-access
+        echo "✅ GCS Bucket created."
+    else
+        echo "✅ GCS Bucket already exists."
+    fi
+
+    # Enable versioning if not already enabled (idempotent)
+    VERSIONING_STATUS=$(gcloud storage buckets describe "gs://$TF_STATE_BUCKET" \
+        --project "$PROJECT_ID" \
+        --format="value(versioning.enabled)" 2>/dev/null || echo "false")
+
+    if [[ "$VERSIONING_STATUS" != "True" ]]; then
+        echo "Enabling versioning on bucket..."
+        gcloud storage buckets update "gs://$TF_STATE_BUCKET" --versioning
+        echo "✅ Versioning enabled."
+    else
+        echo "✅ Versioning already enabled."
+    fi
+
+    # Force UBLA
+    #gsutil uniformbucketlevelaccess set on "gs://$TF_STATE_BUCKET"
+
+    # Verify uniform bucket-level access is enabled (idempotent check)
+    UBLA_STATUS=$(gcloud storage buckets describe "gs://$TF_STATE_BUCKET" \
+        --format="default(uniform_bucket_level_access)"  2>/dev/null | \
+        grep -oP "uniform_bucket_level_access:\s*\K\w+")
+    if [[ "$UBLA_STATUS" == "true" ]]; then
+        echo "✅ Uniform bucket-level access enabled."
+    else
+        echo "UBLA_STATUS=$UBLA_STATUS"
+        echo "⚠️  Uniform bucket-level access not enabled."
+        # read -p "DEBUG HERE"
+        # exit 1
+    fi
+
+    # 8.5. Grant Service Account Access to Bucket (CRITICAL for UBLA)
+    echo "Configuring bucket IAM permissions for service account..."
+
+    # With UBLA, project-level storage.admin doesn't automatically grant bucket access
+    # We need to explicitly grant permissions on the bucket itself
+
+    # Check if service account already has bucket permissions
+    BUCKET_IAM=$(gsutil iam get "gs://$TF_STATE_BUCKET" 2>/dev/null || echo "")
+
+    if echo "$BUCKET_IAM" | grep -q "serviceAccount:$SA_EMAIL"; then
+        echo "✅ Service account already has bucket permissions."
+    else
+        echo "Granting service account access to bucket..."
+
+        # Grant Storage Object Admin (read/write objects)
+        gsutil iam ch "serviceAccount:$SA_EMAIL:objectAdmin" "gs://$TF_STATE_BUCKET" 2>/dev/null || \
+            echo "⚠️  Could not grant objectAdmin (may already have via storage.admin)"
+
+        # Grant Legacy Bucket Owner (full bucket control)
+        gsutil iam ch "serviceAccount:$SA_EMAIL:legacyBucketOwner" "gs://$TF_STATE_BUCKET" 2>/dev/null || \
+            echo "⚠️  Could not grant legacyBucketOwner (may already have via storage.admin)"
+
+        echo "✅ Bucket IAM permissions configured."
+    fi
+
+    # Grant user access to bucket as well (for local testing)
+    if echo "$BUCKET_IAM" | grep -q "user:$ACTIVE_ACCOUNT"; then
+        echo "✅ Your user account already has bucket permissions."
+    else
+        echo "Granting your user account access to bucket..."
+        gsutil iam ch "user:$ACTIVE_ACCOUNT:objectAdmin" "gs://$TF_STATE_BUCKET" 2>/dev/null || \
+            echo "⚠️  Could not grant objectAdmin to user"
+        gsutil iam ch "user:$ACTIVE_ACCOUNT:legacyBucketOwner" "gs://$TF_STATE_BUCKET" 2>/dev/null || \
+            echo "⚠️  Could not grant legacyBucketOwner to user"
+    fi
+
+    # 9. Add lifecycle rules — 180-day expiry on GCS status object prefixes.
+    # These are written by write-exit-status/run and the wave runner; the purge
+    # script (scripts/human-only-scripts/purge-gcs-status/run) handles routine
+    # cleanup.  This rule is a backstop in case purge is never run.
+    local _LIFECYCLE_FILE
+    _LIFECYCLE_FILE=$(mktemp /tmp/gcs-lifecycle-XXXXXX.json)
+    cat > "$_LIFECYCLE_FILE" <<'LIFECYCLE_EOF'
+{
+  "rule": [
+    {
+      "action": {"type": "Delete"},
+      "condition": {
+        "age": 180,
+        "matchesPrefix": ["unit_status/", "wave_status/"]
+      }
+    }
+  ]
+}
+LIFECYCLE_EOF
+    echo "Setting GCS lifecycle rules on bucket $TF_STATE_BUCKET..."
+    gsutil lifecycle set "$_LIFECYCLE_FILE" "gs://$TF_STATE_BUCKET" 2>/dev/null || \
+        echo "⚠️  Could not set lifecycle rules (requires storage.buckets.update permission)"
+    rm -f "$_LIFECYCLE_FILE"
+
+    # 10. Setup Workload Identity Federation
+    setup_workload_identity_federation
+}
+
+################################################################################
+# CLI COMMANDS
+################################################################################
+
+function build() {
+    echo "$SEP"
+    echo "BUILDING GCP SEED"
+    echo "$SEP"
+    install_tools
+    setup_gcp
+}
+
+function test_app() {
+    check_project
+
+    if ! gcloud projects describe "$PROJECT_ID" &>/dev/null; then
+        echo "❌ Project $PROJECT_ID does not exist. Run --build first."
+        exit 1
+    fi
+
+    # FIX: Explicitly set account to ensure CLI context matches ADC for impersonation
+    gcloud config set project "$PROJECT_ID" --quiet &>/dev/null
+    gcloud config set account "$ACTIVE_ACCOUNT" --quiet &>/dev/null
+
+    echo "Running connectivity test to GCS..."
+    echo "Authentication method: $AUTH_METHOD"
+
+    IMPERSONATE_FLAG=""
+
+    if [[ "$AUTH_METHOD" == "keyfile" ]]; then
+        if [ ! -f "$KEY_FILE" ]; then
+            echo "❌ Key file not found at $KEY_FILE. Run --build first."
+            exit 1
+        fi
+        export GOOGLE_APPLICATION_CREDENTIALS="$KEY_FILE"
+        echo "Using key file: $KEY_FILE"
+    else
+        echo "Using service account impersonation: $SA_EMAIL"
+        IMPERSONATE_FLAG="--impersonate-service-account=$SA_EMAIL"
+
+        echo "Verifying impersonation permissions..."
+        MAX_RETRIES=6
+        RETRY_COUNT=0
+
+        while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+            # FIX: Use print-access-token to verify the API and role are functional
+            if gcloud auth print-access-token $IMPERSONATE_FLAG &>/dev/null; then
+                echo "✅ Impersonation working."
+                break
+            else
+                RETRY_COUNT=$((RETRY_COUNT + 1))
+                if [ $RETRY_COUNT -lt $MAX_RETRIES ]; then
+                    echo "⏳ Permission check failed. (attempt $RETRY_COUNT/$MAX_RETRIES)"
+                    # FIX: Force-enable the API if it failed during the test
+                    gcloud services enable iamcredentials.googleapis.com --project "$PROJECT_ID" --quiet &>/dev/null
+                    sleep 10
+                else
+                    echo ""
+                    echo "❌ Impersonation failed. This is likely a permission issue, not propagation."
+                    echo "Run this to verify: gcloud iam service-accounts get-iam-policy $SA_EMAIL"
+                    exit 1
+                fi
+            fi
+        done
+    fi
+
+    echo "test-data-$(date)" > connection-test.tmp
+
+    # Execute storage commands with explicit flag handling
+    if [ -n "$IMPERSONATE_FLAG" ]; then
+        gcloud storage cp connection-test.tmp "gs://$TF_STATE_BUCKET/test-connection.txt" $IMPERSONATE_FLAG
+        gcloud storage rm "gs://$TF_STATE_BUCKET/test-connection.txt" $IMPERSONATE_FLAG
+    else
+        gcloud storage cp connection-test.tmp "gs://$TF_STATE_BUCKET/test-connection.txt"
+        gcloud storage rm "gs://$TF_STATE_BUCKET/test-connection.txt"
+    fi
+
+    rm -f connection-test.tmp
+    echo "✅ GCS Read/Write Verified."
+}
+
+function cleanup_bucket() {
+    if gcloud storage buckets describe "gs://$TF_STATE_BUCKET" --project "$PROJECT_ID" &>/dev/null; then
+        echo "Emptying GCS Bucket (all versions)..."
+        gcloud storage rm --recursive "gs://$TF_STATE_BUCKET/**" 2>/dev/null || echo "Bucket already empty or inaccessible."
+        echo "Deleting GCS Bucket..."
+        gcloud storage buckets delete "gs://$TF_STATE_BUCKET" --project "$PROJECT_ID" 2>/dev/null || echo "Bucket already deleted."
+        echo "✅ GCS Bucket deleted."
+    else
+        echo "✅ GCS Bucket $TF_STATE_BUCKET does not exist. Skipping."
+    fi
+}
+
+function clean() {
+    check_project
+
+    if gcloud projects describe "$PROJECT_ID" &>/dev/null; then
+        gcloud config set project "$PROJECT_ID" 2>/dev/null
+        cleanup_bucket
+    else
+        echo "✅ Project $PROJECT_ID does not exist. Skipping bucket cleanup."
+    fi
+
+    #echo "Wiping local master key file..."
+    #rm -rf "$KEY_DIR"
+    #echo "✅ Local credentials removed."
+}
+
+function clean_all() {
+    check_project
+
+    #if ! gcloud projects describe "$PROJECT_ID" &>/dev/null; then
+    #    echo "✅ Project $PROJECT_ID does not exist. Nothing to clean."
+    #    rm -rf "$KEY_DIR"
+    #    exit 0
+    #fi
+
+    gcloud config set project "$PROJECT_ID" 2>/dev/null
+
+    echo "$SEP"
+    echo "DANGER: Destructive Deletion of GCP Seed Resources"
+    echo "Target Project: $PROJECT_ID"
+    echo "$SEP"
+
+    read -p "Type the Project ID ($PROJECT_ID) to confirm deletion: " CONFIRM_ID
+    if [[ "$CONFIRM_ID" == "$PROJECT_ID" ]]; then
+
+        # Idempotent Service Account Cleanup
+        if gcloud iam service-accounts describe "$SA_EMAIL" --project "$PROJECT_ID" &>/dev/null; then
+            echo "Cleaning up Service Account..."
+
+            # Delete all keys
+            KEYS=$(gcloud iam service-accounts keys list \
+                --iam-account="$SA_EMAIL" \
+                --project "$PROJECT_ID" \
+                --filter="keyType=USER_MANAGED" \
+                --format="value(name)" 2>/dev/null || echo "")
+
+            if [[ -n "$KEYS" ]]; then
+                echo "Deleting Service Account keys..."
+                echo "$KEYS" | while read -r key_name; do
+                    if [[ -n "$key_name" ]]; then
+                        echo "Deleting key: $key_name"
+                        gcloud iam service-accounts keys delete "$key_name" \
+                            --iam-account="$SA_EMAIL" \
+                            --project "$PROJECT_ID" \
+                            --quiet 2>/dev/null || echo "Key already deleted."
+                    fi
+                done
+            fi
+
+            # Remove IAM bindings
+            echo "Removing IAM policy bindings..."
+            gcloud projects remove-iam-policy-binding "$PROJECT_ID" \
+                --member="serviceAccount:$SA_EMAIL" \
+                --role="roles/owner" \
+                --quiet 2>/dev/null || echo "IAM binding already removed."
+
+            # Delete the Service Account
+            echo "Deleting Service Account: $SA_EMAIL..."
+            gcloud iam service-accounts delete "$SA_EMAIL" \
+                --project "$PROJECT_ID" \
+                --quiet 2>/dev/null || echo "Service Account already deleted."
+        else
+            echo "✅ Service Account $SA_EMAIL does not exist. Skipping."
+        fi
+
+        # Delete Workload Identity Federation resources
+        cleanup_workload_identity
+
+        # Optional: Delete the entire project (commented out for safety)
+        # Uncomment the following lines if you want to delete the entire project
+        # echo "Deleting GCP Project: $PROJECT_ID..."
+        # gcloud projects delete "$PROJECT_ID" --quiet
+
+        if [[ "$AUTH_METHOD" == "keyfile" ]]; then
+            _clear_sa_key_from_sops
+        fi
+        clean
+
+        echo "✅ GCP Resources and local credentials wiped."
+    else
+        echo "Confirmation failed. Aborting."
+        exit 1
+    fi
+
+    cat <<EOF
+Note: The Project was not deleted.
+Deleting and re-creating projects frequently in Google is not really supported.
+The problem is that there is no way to truly purge a deleted project.
+Projects persist in a recoverable state for 30 days, and can not be purged.
+They count toward the account quota for projects (which defaults to 5...).
+So, don't delete projects until/unless absolutely necessary.
+Instead, re-use them.
+To see your quota:
+  gcloud beta quotas info list --service=cloudresourcemanager.googleapis.com --organization=<ORG_ID> | yq '.dimensionsInfos[].details.value'
+  # gcloud projects list # list projects
+EOF
+}
+
+function show_status() {
+    echo "$SEP"
+    echo "GCP SEED PROJECT STATUS"
+    echo "$SEP"
+
+    # Basic Configuration
+    echo "Configuration:"
+    echo "  Project ID:     $PROJECT_ID"
+    echo "  Region:         $REGION"
+    echo "  Organization:   ${GCP_ORG_ID:-"None (personal account)"}"
+    echo "  Environment:    $ENV_TAG_VALUE"
+    echo "  Auth Method:    $AUTH_METHOD"
+    echo ""
+
+    # Authentication Details
+    echo "Authentication:"
+    if [[ "$AUTH_METHOD" == "keyfile" ]]; then
+        echo "  Key File:       $KEY_FILE"
+        if [ -f "$KEY_FILE" ]; then
+            echo "  Key Status:     ✅ Present"
+        else
+            echo "  Key Status:     ❌ Missing"
+        fi
+        echo ""
+        echo "  Usage:"
+        echo "    export GOOGLE_APPLICATION_CREDENTIALS=\"$KEY_FILE\""
+    else
+        echo "  SA Email:       $SA_EMAIL"
+        echo ""
+        echo "  Usage:"
+        echo "    export GOOGLE_IMPERSONATE_SERVICE_ACCOUNT=\"$SA_EMAIL\""
+        echo ""
+        echo "  Or in Terraform/OpenTofu:"
+        echo "    provider \"google\" {"
+        echo "      impersonate_service_account = \"$SA_EMAIL\""
+        echo "    }"
+    fi
+    echo ""
+
+    # Resource Status
+    if command -v gcloud &>/dev/null; then
+        echo "$SEP"
+        echo "RESOURCE STATUS"
+        echo "$SEP"
+
+        # Project Status
+        echo "📦 Project:"
+        if gcloud projects describe "$PROJECT_ID" &>/dev/null; then
+            PROJECT_NUMBER=$(gcloud projects describe "$PROJECT_ID" --format="value(projectNumber)" 2>/dev/null)
+            PROJECT_STATE=$(gcloud projects describe "$PROJECT_ID" --format="value(lifecycleState)" 2>/dev/null)
+            echo "  Status:         ✅ $PROJECT_STATE"
+            echo "  Project Number: $PROJECT_NUMBER"
+            echo "  Console:        https://console.cloud.google.com/home/dashboard?project=$PROJECT_ID"
+        else
+            echo "  Status:         ❌ Not found"
+        fi
+        echo ""
+
+        # Billing Status
+        echo "💳 Billing:"
+        BILLING_STATUS=$(gcloud billing projects describe "$PROJECT_ID" --format="value(billingEnabled)" 2>/dev/null || echo "false")
+        BILLING_ACCOUNT=$(gcloud billing projects describe "$PROJECT_ID" --format="value(billingAccountName)" 2>/dev/null || echo "None")
+        if [[ "$BILLING_STATUS" == "True" ]]; then
+            echo "  Status:         ✅ Enabled"
+            echo "  Account:        $BILLING_ACCOUNT"
+        else
+            echo "  Status:         ❌ Disabled"
+        fi
+        echo ""
+
+        # Tags Status (if in organization)
+        if [[ -n "$GCP_ORG_ID" ]]; then
+            echo "🏷️  Project Tags:"
+            PROJECT_TAGS=$(gcloud resource-manager tags bindings list \
+                --parent="//cloudresourcemanager.googleapis.com/projects/$PROJECT_ID" \
+                --format="value(tagValue)" 2>/dev/null || echo "")
+
+            if [[ -n "$PROJECT_TAGS" ]]; then
+                echo "  Status:         ✅ Tags applied"
+                while IFS= read -r tag; do
+                    # Extract tag key and value from the full path
+                    TAG_KEY=$(echo "$tag" | grep -oP 'tagKeys/\K[^/]+' || echo "unknown")
+                    TAG_VAL=$(echo "$tag" | grep -oP 'tagValues/\K[^/]+' || echo "unknown")
+                    echo "  Tag:            $TAG_KEY = $TAG_VAL"
+                done <<< "$PROJECT_TAGS"
+            else
+                echo "  Status:         ⚠️  No tags applied"
+                echo "  Note:           Tags are optional but useful for organization"
+            fi
+            echo ""
+        fi
+
+        # Service Account Status
+        echo "🔐 Service Account:"
+        if gcloud iam service-accounts describe "$SA_EMAIL" --project "$PROJECT_ID" &>/dev/null; then
+            echo "  Status:         ✅ Active"
+            echo "  Email:          $SA_EMAIL"
+
+            # Check IAM roles
+            echo "  Roles:"
+            SA_ROLES=$(gcloud projects get-iam-policy "$PROJECT_ID" \
+                --flatten="bindings[].members" \
+                --filter="bindings.members:serviceAccount:$SA_EMAIL" \
+                --format="value(bindings.role)" 2>/dev/null | sort -u)
+
+            if [[ -n "$SA_ROLES" ]]; then
+                while IFS= read -r role; do
+                    echo "    - $role"
+                done <<< "$SA_ROLES"
+            else
+                echo "    - ❌ No roles found"
+            fi
+
+            # Check keys if using keyfile method
+            if [[ "$AUTH_METHOD" == "keyfile" ]]; then
+                KEY_COUNT=$(gcloud iam service-accounts keys list \
+                    --iam-account="$SA_EMAIL" \
+                    --project "$PROJECT_ID" \
+                    --filter="keyType=USER_MANAGED" \
+                    --format="value(name)" 2>/dev/null | wc -l)
+                echo "  Keys:           $KEY_COUNT user-managed key(s)"
+            fi
+        else
+            echo "  Status:         ❌ Not found"
+        fi
+        echo ""
+
+        # GCS Bucket Status
+        echo "🪣 GCS State Bucket:"
+        if gcloud storage buckets describe "gs://$TF_STATE_BUCKET" --project "$PROJECT_ID" &>/dev/null; then
+            echo "  Status:         ✅ Active"
+            echo "  Name:           gs://$TF_STATE_BUCKET"
+
+            BUCKET_LOCATION=$(gcloud storage buckets describe "gs://$TF_STATE_BUCKET" \
+                --project "$PROJECT_ID" \
+                --format="value(location)" 2>/dev/null)
+            echo "  Location:       $BUCKET_LOCATION"
+
+            VERSIONING=$(gcloud storage buckets describe "gs://$TF_STATE_BUCKET" \
+                --project "$PROJECT_ID" \
+                --format="value(versioning.enabled)" 2>/dev/null)
+            if [[ "$VERSIONING" == "True" ]]; then
+                echo "  Versioning:     ✅ Enabled"
+            else
+                echo "  Versioning:     ❌ Disabled"
+            fi
+
+            UBLA=$(gcloud storage buckets describe "gs://$TF_STATE_BUCKET" \
+                --project "$PROJECT_ID" \
+                --format="value(iamConfiguration.uniformBucketLevelAccess.enabled)" 2>/dev/null)
+            if [[ "$UBLA" == "True" ]]; then
+                echo "  Access:         ✅ Uniform bucket-level access"
+            else
+                echo "  Access:         ⚠️  Fine-grained ACLs"
+            fi
+
+            # Object count
+            OBJECT_COUNT=$(gcloud storage ls "gs://$TF_STATE_BUCKET/**" 2>/dev/null | wc -l || echo "0")
+            echo "  Objects:        $OBJECT_COUNT file(s)"
+            echo "  Console:        https://console.cloud.google.com/storage/browser/$TF_STATE_BUCKET?project=$PROJECT_ID"
+        else
+            echo "  Status:         ❌ Not found"
+        fi
+        echo ""
+
+        # Enabled APIs
+        echo "🔌 Enabled APIs:"
+        ENABLED_APIS=$(gcloud services list --enabled --project "$PROJECT_ID" --format="value(config.name)" 2>/dev/null | grep -E "(compute|storage|iam|cloudresourcemanager)" | head -5)
+        if [[ -n "$ENABLED_APIS" ]]; then
+            while IFS= read -r api; do
+                echo "  - $api"
+            done <<< "$ENABLED_APIS"
+            API_COUNT=$(gcloud services list --enabled --project "$PROJECT_ID" --format="value(config.name)" 2>/dev/null | wc -l)
+            echo "  ... and $((API_COUNT - 5)) more"
+        else
+            echo "  - None found"
+        fi
+    else
+        echo "❌ gcloud CLI not available. Install with --build"
+    fi
+
+    echo ""
+    echo "$SEP"
+    echo "Next Steps:"
+    echo "$SEP"
+    echo "1. Verify connectivity: ./run --test"
+    echo "2. Configure Terragrunt backend with:"
+    echo "   Bucket: $TF_STATE_BUCKET"
+    echo "   Project: $PROJECT_ID"
+    if [[ "$AUTH_METHOD" == "impersonation" ]]; then
+        echo "3. Set environment variable:"
+        echo "   export GOOGLE_IMPERSONATE_SERVICE_ACCOUNT=\"$SA_EMAIL\""
+    else
+        echo "3. Set environment variable:"
+        echo "   export GOOGLE_APPLICATION_CREDENTIALS=\"$KEY_FILE\""
+    fi
+    echo ""
+}
+
+function show_usage() {
+    printf "Usage: $0 <command>\n"
+    cat <<EOF
+    --seed|-b       Install tools and provision GCP seed resources
+    --login|-l      Verify GCP authentication
+    --test|-t       Verify GCS bucket access
+    --status|-S     Show GCP resource status
+    --clean         Remove GCS bucket
+    --clean-all     DELETE bucket, service account, and WIF resources
+    --help|-h       Show this help
+EOF
+    exit 1
+}
+
+################################################################################
+# MAIN
+################################################################################
+
+case "${1:-}" in
+    --seed|-b)    _load_seed_config; build ;;
+    --login|-l)   _load_seed_config; check_project ;;
+    --test|-t)    _load_seed_config; test_app ;;
+    --status|-S)  _load_seed_config; show_status ;;
+    --clean)      _load_seed_config; clean ;;
+    --clean-all)  _load_seed_config; clean_all ;;
+    --help|-h)    show_usage ;;
+    *) echo "Usage: $0 <--seed|--login|--test|--status|--clean|--clean-all>" >&2; exit 1 ;;
+esac

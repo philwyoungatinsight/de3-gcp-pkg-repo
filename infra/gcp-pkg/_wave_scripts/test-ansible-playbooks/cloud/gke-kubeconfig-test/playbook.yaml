@@ -1,0 +1,102 @@
+---
+# Wave test: verify kubectl access to the GKE cluster by running 'kubectl get nodes'
+# and asserting at least one node is in Ready state.
+- name: GKE kubeconfig test — verify kubectl get nodes
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  tasks:
+    - name: Read cluster config from YAML files
+      ansible.builtin.shell: |
+        python3 << 'PYEOF'
+        import yaml, os, glob
+
+        infra_dir   = os.environ['_INFRA_DIR']
+        dynamic_dir = os.environ['_DYNAMIC_DIR']
+
+        def load_config_params(yaml_path):
+            try:
+                with open(yaml_path) as f:
+                    cfg = yaml.safe_load(f)
+            except Exception:
+                return {}
+            if not isinstance(cfg, dict):
+                return {}
+            for pkg_data in cfg.values():
+                if isinstance(pkg_data, dict):
+                    cp = pkg_data.get('config_params', {})
+                    if isinstance(cp, dict) and cp:
+                        return cp
+            return {}
+
+        all_cp = {}
+        for yf in sorted(glob.glob(f"{infra_dir}/*/_config/*.yaml")):
+            if '.sops.' not in yf:
+                all_cp.update(load_config_params(yf))
+
+        cluster_entries = [
+            (k, v) for k, v in all_cp.items()
+            if isinstance(v, dict) and 'cluster_name' in v and '/examples/' not in k
+        ]
+        cluster_path_key = cluster_entries[0][0]
+        cluster_name     = cluster_entries[0][1]['cluster_name']
+
+        kb_entries = [(k, v) for k, v in all_cp.items()
+                      if isinstance(v, dict) and 'KUBECONFIG' in v and '/examples/' not in k]
+        cluster_dir_name = cluster_path_key.rstrip('/').split('/')[-1]
+        kb_file = kb_entries[0][1]['KUBECONFIG'] if kb_entries else f"{cluster_dir_name}_kubeconfig.yaml"
+        kb_path = f"{dynamic_dir}/kubeconfig/{kb_file}"
+
+        print(f"{cluster_name} {kb_path}")
+        PYEOF
+      register: _cfg
+      changed_when: false
+      environment:
+        _INFRA_DIR:   "{{ lookup('env', '_INFRA_DIR') }}"
+        _DYNAMIC_DIR: "{{ lookup('env', '_DYNAMIC_DIR') }}"
+
+    - name: Set cluster config facts
+      ansible.builtin.set_fact:
+        _cluster_name:   "{{ _cfg.stdout.split()[0] }}"
+        _kubeconfig_path: "{{ _cfg.stdout.split()[1] }}"
+
+    - name: Verify kubeconfig file exists
+      ansible.builtin.stat:
+        path: "{{ _kubeconfig_path }}"
+      register: _kb_stat
+      failed_when: not _kb_stat.stat.exists
+
+    - name: Run kubectl get nodes and check for Ready nodes
+      ansible.builtin.shell: |
+        READY=$(kubectl get nodes \
+            --kubeconfig="{{ _kubeconfig_path }}" \
+            --output=jsonpath='{range .items[*]}{range .status.conditions[?(@.type=="Ready")]}{.status}{"\n"}{end}{end}' \
+            | grep -c "^True$" || true)
+        echo "ready_count=$READY"
+        if [ "$READY" -eq 0 ]; then
+            echo "ERROR: no Ready nodes in cluster {{ _cluster_name }}" >&2
+            exit 1
+        fi
+      register: _nodes_check
+      changed_when: false
+
+    - name: Show ready node count
+      ansible.builtin.debug:
+        msg: >-
+          PASS — cluster {{ _cluster_name }}:
+          {{ _nodes_check.stdout | regex_search('ready_count=(\d+)', '\1') | first }} node(s) Ready
+
+    - name: Show full node list
+      ansible.builtin.command:
+        argv:
+          - kubectl
+          - get
+          - nodes
+          - "--kubeconfig={{ _kubeconfig_path }}"
+      changed_when: false
+      register: _nodes_list
+
+    - name: Print node list
+      ansible.builtin.debug:
+        msg: "{{ _nodes_list.stdout_lines }}"

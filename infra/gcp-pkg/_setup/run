@@ -1,0 +1,147 @@
+#!/bin/bash
+# gcp-pkg setup — installs Google Cloud SDK, kubectl, and gke-gcloud-auth-plugin.
+# Idempotent: checks whether each tool is present before installing.
+# Supports macOS (Homebrew), Debian/Ubuntu (apt), and Fedora/RHEL (dnf).
+
+set -euo pipefail
+
+GIT_ROOT="$(git rev-parse --show-toplevel)"
+. "$GIT_ROOT/set_env.sh"
+
+# ── helpers ────────────────────────────────────────────────────────────────────
+
+_is_debian() {
+    [ -f /etc/debian_version ]
+}
+
+_has_brew() {
+    command -v brew >/dev/null 2>&1
+}
+
+_has_dnf() {
+    command -v dnf >/dev/null 2>&1
+}
+
+# Returns true if gcloud was installed via apt (package manager controls it).
+_gcloud_is_apt_managed() {
+    dpkg -l google-cloud-cli >/dev/null 2>&1 || dpkg -l google-cloud-sdk >/dev/null 2>&1
+}
+
+_gcloud_is_dnf_managed() {
+    rpm -q google-cloud-cli >/dev/null 2>&1
+}
+
+_setup_google_cloud_repo_dnf() {
+    if [ -f /etc/yum.repos.d/google-cloud-sdk.repo ]; then
+        return
+    fi
+    sudo tee /etc/yum.repos.d/google-cloud-sdk.repo > /dev/null << 'EOM'
+[google-cloud-cli]
+name=Google Cloud CLI
+baseurl=https://packages.cloud.google.com/yum/repos/cloud-sdk-el9-x86_64
+enabled=1
+gpgcheck=1
+repo_gpgcheck=0
+gpgkey=https://packages.cloud.google.com/yum/doc/rpm-package-key.gpg
+EOM
+}
+
+# ── gcloud CLI ────────────────────────────────────────────────────────────────
+# https://cloud.google.com/sdk/docs/install
+_setup_gcloud() {
+    if command -v gcloud >/dev/null 2>&1; then
+        echo "  gcloud: $(gcloud --version 2>&1 | head -1)"
+        return
+    fi
+    echo "==> Installing Google Cloud CLI..."
+    if _has_brew; then
+        brew install --cask google-cloud-sdk
+    elif _is_debian; then
+        # Add the Cloud SDK apt repo and install
+        sudo apt-get install -y apt-transport-https ca-certificates gnupg curl
+        curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg \
+            | sudo gpg --dearmor -o /usr/share/keyrings/cloud.google.gpg
+        echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] \
+https://packages.cloud.google.com/apt cloud-sdk main" \
+            | sudo tee /etc/apt/sources.list.d/google-cloud-sdk.list
+        sudo apt-get update -y
+        sudo apt-get install -y google-cloud-cli
+    elif _has_dnf; then
+        _setup_google_cloud_repo_dnf
+        sudo dnf install -y google-cloud-cli
+    else
+        echo "ERROR: unsupported platform for automatic gcloud install." >&2
+        echo "       Install manually: https://cloud.google.com/sdk/docs/install" >&2
+        exit 1
+    fi
+    echo "  gcloud installed: $(gcloud --version 2>&1 | head -1)"
+}
+
+# ── kubectl ───────────────────────────────────────────────────────────────────
+_setup_kubectl() {
+    if command -v kubectl >/dev/null 2>&1; then
+        echo "  kubectl: $(kubectl version --client 2>&1 | head -1)"
+        return
+    fi
+    echo "==> Installing kubectl..."
+    if _has_brew; then
+        brew install kubectl
+    elif _is_debian && _gcloud_is_apt_managed; then
+        sudo apt-get install -y kubectl
+    elif _has_dnf && _gcloud_is_dnf_managed; then
+        sudo dnf install -y kubectl
+    elif command -v gcloud >/dev/null 2>&1; then
+        gcloud components install kubectl --quiet
+    else
+        echo "ERROR: cannot install kubectl — gcloud not available." >&2
+        echo "       Install manually: https://kubernetes.io/docs/tasks/tools/" >&2
+        exit 1
+    fi
+    echo "  kubectl installed: $(kubectl version --client 2>&1 | head -1)"
+}
+
+# ── gke-gcloud-auth-plugin ────────────────────────────────────────────────────
+# Required for kubectl to authenticate against GKE clusters.
+# https://cloud.google.com/kubernetes-engine/docs/how-to/cluster-access-for-kubectl#install_plugin
+_setup_gke_auth_plugin() {
+    if command -v gke-gcloud-auth-plugin >/dev/null 2>&1; then
+        echo "  gke-gcloud-auth-plugin: $(gke-gcloud-auth-plugin --version 2>&1 | head -1)"
+        return
+    fi
+    echo "==> Installing gke-gcloud-auth-plugin..."
+    if _has_brew; then
+        # brew-managed gcloud disables `gcloud components install`.
+        # The plugin is bundled with the google-cloud-sdk cask; if it is
+        # missing here, reinstall the cask: brew reinstall --cask google-cloud-sdk
+        #echo "ERROR: gke-gcloud-auth-plugin not found." >&2
+        #echo "       Run: brew reinstall --cask google-cloud-sdk" >&2
+        #exit 1
+        brew reinstall --cask google-cloud-sdk
+    elif _is_debian && _gcloud_is_apt_managed; then
+        sudo apt-get install -y google-cloud-sdk-gke-gcloud-auth-plugin
+    elif _has_dnf && _gcloud_is_dnf_managed; then
+        sudo dnf install -y google-cloud-cli-gke-gcloud-auth-plugin
+    elif command -v gcloud >/dev/null 2>&1; then
+        gcloud components install gke-gcloud-auth-plugin --quiet
+    else
+        echo "ERROR: cannot install gke-gcloud-auth-plugin — gcloud not available." >&2
+        echo "       Install manually: https://cloud.google.com/kubernetes-engine/docs/how-to/cluster-access-for-kubectl#install_plugin" >&2
+        exit 1
+    fi
+    echo "  gke-gcloud-auth-plugin installed: $(gke-gcloud-auth-plugin --version 2>&1 | head -1)"
+}
+
+# ── main ───────────────────────────────────────────────────────────────────────
+
+_install_tools() {
+    echo "=== gcp-pkg setup ==="
+    _setup_gcloud
+    _setup_kubectl
+    _setup_gke_auth_plugin
+    echo "=== gcp-pkg setup complete ==="
+}
+
+case "${1:-}" in
+    "") _install_tools ;;
+    *)  exec "$(dirname "$0")/seed" "$@" ;;
+esac
