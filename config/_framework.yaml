@@ -1,2 +1,7 @@
 _framework:
   main_package: gcp-pkg
+  labels:
+    - name: _purpose
+      value: GCP cloud infrastructure provisioning and management
+    - name: _docs
+      value: https://github.com/philwyoungatinsight/de3-gcp-pkg-repo
